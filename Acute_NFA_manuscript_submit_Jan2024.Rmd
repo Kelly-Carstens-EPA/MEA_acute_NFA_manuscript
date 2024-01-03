@@ -736,7 +736,7 @@ all.aenm.sum
 ```{r warning=FALSE, message=FALSE, error=TRUE}
 all.aenm.active <- list("Acute Active" = hitsum.tbl.wide[acute.active==1,dsstox_substance_id], "Dev Active" = hitsum.tbl.wide[dev.active==1,dsstox_substance_id])
 
-venn.diagram(all.aenm.active, "figures/Fig2C_overlap_all_MEA_aenm_active.png", 
+venn.diagram(all.aenm.active, "figures/Fig2D_overlap_all_MEA_aenm_active.png", 
              main = "Overlap of MFR active in acute and dev (MC + SC)", 
              main.pos = c(0.5, 0.80), 
              main.just = c(0.5, 1),
@@ -2136,9 +2136,9 @@ sum(df.mc[assay_type %in% "dev", hitc])
 ## Supp File
 ```{r  results= "hide", warning=FALSE, message=FALSE}
 
-#read.me <- read.xlsx('input/README_supplementals.xlsx')
+read.me <- read.xlsx('input/README.xlsx')
 
-list.supp <- list(#'README'= read.me,
+list.supp <- list('ReadMe'= read.me,
                   'SuppTb1'=chem.tbl,
                   'SuppTb2'=end.cat.tbl,
                   'SuppTb3'=methods.tbl.mc.sc,
