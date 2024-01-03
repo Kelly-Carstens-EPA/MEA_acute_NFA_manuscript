@@ -1,0 +1,2150 @@
+---
+title: "Manuscipt: Chemical effects on neural network activity: comparison of acute versus network formation exposure in microelectrode array assays"
+author: "KEC"
+date: "January 02, 2023"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide 
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+library(tcpl)
+library(data.table)
+library(VennDiagram)
+library(ggplot2)
+library(dplyr)
+library(openxlsx)
+library(gplots)
+library(viridis)
+library(pheatmap)
+library(corrplot)
+library(ggrepel)
+library(ggpp)
+library(ggpmisc)
+library(usedist)
+library(factoextra)
+
+knitr::opts_chunk$set(echo = TRUE)
+sessionInfo()
+```
+
+# 1. Load data 
+Load ToxCast multi-concentration (mc) and single-concentration (sc) screening data from ToxCast invitrodb v3.5, levels mc5, mc6, sc2 for the MEA_acute and MEA_dev endpoints.
+More information on tcpl data processing and retrieval: https://cran.r-project.org/web/packages/tcpl/vignettes/
+
+## multi-conc
+```{r warning=FALSE, message=FALSE}
+tcplConf(user='_dataminer', pass='pass', #insert user and pass
+         db='prod_internal_invitrodb_v3_5', drvr='MySQL',
+         host='ccte-mysql-res.epa.gov') #insert host
+
+# # Load mc data
+# neuro.asids <- c(20)
+# neuro.assays <- tcplLoadAeid(val=neuro.asids, fld='asid',add.fld='acid')
+# all.assays <- tcplLoadAeid(add.fld='asid')
+# 
+# mc5.neuro <- tcplPrepOtpt(tcplLoadData(lvl=5,type='mc', fld='aeid',val=neuro.assays$aeid))
+# mc6 <- tcplPrepOtpt(tcplLoadData(lvl=6, fld='m4id', val=mc5.neuro$m4id, type='mc'))
+# setDT(mc6)
+# mc6_mthds <- mc6[ , .( mc6_mthd_id = paste(mc6_mthd_id, collapse=",")), by = m4id]
+# mc6_flags <- mc6[ , .( flag = paste(flag, collapse=";")), by = m4id]
+# mc5.neuro$mc6_flags <- mc6_mthds$mc6_mthd_id[match(mc5.neuro$m4id, mc6_mthds$m4id)]
+# mc5.neuro[, flag.length := ifelse(!is.na(mc6_flags), count.fields(textConnection(mc6_flags), sep =','), NA)]
+# mc5.neuro[hitc==1,ac50_uM := ifelse(!is.na(modl_ga), 10^modl_ga, NA)]
+# mc5.neuro[hitc==1,acc_uM := ifelse(!is.na(modl_acc), 10^modl_ga, NA)]
+# 
+# mc5.neuro <- tcplSubsetChid(mc5.neuro)
+# # # Load sc data
+# # # the necessary sc endpoints for this analysis are not in invitrodb v3.5
+# # # sc2.neuro <- tcplPrepOtpt(tcplLoadData(lvl=2, type='sc',fld='aeid',val=neuro.assays$aeid))
+# #
+# save(mc5.neuro,
+#      mc6,
+#      neuro.assays,
+#      file="./source/mc_tcpl_MEA_invitrodb_v3_5_07June23.RData")
+
+load(file="./source/mc_tcpl_MEA_invitrodb_v3_5_07June23.RData")
+```
+
+## single-conc
+This sc MEA data was not released in invitrodb v3.5 but can be accessed in the source files of this manuscript.
+
+```{r warning=FALSE, message=FALSE}
+
+load("source/mea_acute_and_dev_sc2_tcplSubsetChid_2022-02-10.RData")
+load("source/ccte_mfr_sc_data_20Sept2022.RData") 
+
+```
+
+## Apply ToxCast flag filters
+Exclude endpoints with 3 or more flags
+```{r warning=FALSE, message=FALSE}
+
+# filter the dataset, with coarse filters, adds a column called use.me
+mc5_filter <- function(df) {
+df[, use.me := 0]
+df[hitc==1 & flag.length < 3, use.me := 1]
+df[hitc==1 & is.na(flag.length), use.me := 1]
+df[hitc==1 & flag.length >= 3, use.me := 0]
+df[fitc %in% c(36,45), use.me := 0]
+df[hitc==-1, use.me := 0] # make hitc interpretable as a positive sum
+df[use.me==0, modl_ga := as.numeric(NA)]
+df[use.me==0, hitc := 0]
+df[hitc==0, modl_ga := as.numeric(NA)]
+}
+
+mc5.neuro <- mc5_filter(mc5.neuro)
+mc5.neuro <- mc5.neuro[!is.na(casn),] # Remove control rows, e.g. DMSO/ water
+
+```
+
+## Update acute LDH SC cutoff to 10pc
+```{r warning=FALSE, message=FALSE}
+ldh <- sc2.chid[aenm %in% 'CCTE_Shafer_MEA_LDH',]
+unique(ldh[, c('bmad','coff','hitc')])
+
+ggplot(data=ldh, aes(x=max_med))+
+  geom_histogram()+
+  geom_vline(aes(xintercept = coff))
+
+sc2.chid[aenm %in% 'CCTE_Shafer_MEA_LDH', coff := 10]
+sc2.chid[aenm %in% 'CCTE_Shafer_MEA_LDH', hitc := ifelse(max_med>10,1,0)]
+```
+
+# 2. Wrangle data tables
+
+## Filter endpoints
+Only evaluate the sc cyto endpoints (AB + LDH) and the MFR endpoint.
+```{r warning=FALSE, message=FALSE}
+
+# mc
+mc5.neuro[grep("_dev",aenm), assay_type := "dev"]
+mc5.neuro[grep("_acute",aenm), assay_type := "acute"]
+
+# sc
+unique(sc2.chid$aenm) #26 endpoints
+length(unique(sc2.chid$chnm)) #1172 chemicals
+unique(sc2.mfr$aenm) # add data for pfas chemicals in mfr endpoint
+length(unique(sc2.mfr$chnm)) # 133 chemicals
+setdiff(colnames(sc2.chid), colnames(sc2.mfr))
+
+sc2.neuro <- rbind(sc2.chid, sc2.mfr, fill=T)
+sc2.neuro <- sc2.neuro[!grep("DIV12",aenm),]
+sc2.neuro[, assay_type := "acute"]
+sc2.neuro[grep("dev_",aenm), assay_type := "dev"]
+
+sc2.neuro <- sc2.neuro[!is.na(casn),]
+exclude.sc <- c(2500,2501,2512,2513,2518,2519,2526,2527) # only evaluate MFR + cyto
+sc2.neuro <- sc2.neuro[!aeid %in% exclude.sc,]
+unique(sc2.neuro[, c('aenm','aeid','assay_type')])
+#                                       aenm aeid assay_type
+# 1:              CCTE_Shafer_MEA_dev_LDH_dn 2529        dev
+# 2:               CCTE_Shafer_MEA_dev_AB_dn 2530        dev
+# 3:                  CCTE_Shafer_MEA_MFR_up 2033      acute
+# 4:                  CCTE_Shafer_MEA_MFR_dn 2034      acute
+# 5:                     CCTE_Shafer_MEA_LDH 2035      acute
+# 6:                      CCTE_Shafer_MEA_AB 2036      acute
+# 7: CCTE_Shafer_MEA_dev_firing_rate_mean_dn 2494        dev
+# 8: CCTE_Shafer_MEA_dev_firing_rate_mean_up 2495        dev
+
+```
+
+## Map sc + mc endpoint names
+```{r warning=FALSE, message=FALSE}
+
+# create table of mc and sc endpoints by aeid and find which ones don't match
+aenm.tbl <- unique(mc5.neuro[,c('aeid','aenm')])
+aenm.tbl$aenm.sc <- sc2.neuro$aenm[match(aenm.tbl$aeid, sc2.neuro$aeid)]
+#check if any sc endpoint are missing
+setdiff(sc2.neuro$aenm, aenm.tbl$aenm.sc)
+# [1] "CCTE_Shafer_MEA_MFR_up" "CCTE_Shafer_MEA_MFR_dn" "CCTE_Shafer_MEA_LDH"   
+# [4] "CCTE_Shafer_MEA_AB" 
+# update aeid to match mc5 aeid
+diff.aenm <- setdiff(sc2.neuro$aenm, aenm.tbl$aenm.sc)
+
+unique(sc2.neuro[aenm %in% diff.aenm,c('aenm','aeid')])
+# update sc data with the aeids that are used in mc
+sc2.neuro[aenm %in% "CCTE_Shafer_MEA_MFR_up", aeid := 2457]
+sc2.neuro[aenm %in% "CCTE_Shafer_MEA_MFR_up", aenm := "CCTE_Shafer_MEA_acute_firing_rate_mean_up"]
+sc2.neuro[aenm %in% "CCTE_Shafer_MEA_MFR_dn", aeid := 2456]
+sc2.neuro[aenm %in% "CCTE_Shafer_MEA_MFR_dn", aenm := "CCTE_Shafer_MEA_acute_firing_rate_mean_dn"]
+sc2.neuro[aenm %in% "CCTE_Shafer_MEA_LDH", aeid := 2540]
+sc2.neuro[aenm %in% "CCTE_Shafer_MEA_LDH", aenm := "CCTE_Shafer_MEA_acute_LDH_up"]
+sc2.neuro[aenm %in% "CCTE_Shafer_MEA_AB", aeid := 2541]
+sc2.neuro[aenm %in% "CCTE_Shafer_MEA_AB", aenm := "CCTE_Shafer_MEA_acute_AB_dn"]
+
+# remapping the endpoints
+aenm.tbl$aenm.sc <- sc2.neuro$aenm[match(aenm.tbl$aeid, sc2.neuro$aeid)]
+setdiff(sc2.neuro$aenm, aenm.tbl$aenm.sc) # all were mapped successfully by aeid
+```
+
+## Extract tcpl methods
+
+### mc
+```{r warning=FALSE, message=FALSE}
+
+methods.mc <- function(aeids, type.in) {
+  #acid
+  mc2_mthds <- tcplMthdLoad(2,aeids$acid, type.in)
+  mc2_mthds_agg <- aggregate(mthd_id ~ acid, mc2_mthds, toString)
+  mc2_list <- tcplMthdList(lvl=2, type=type.in)
+  mc2_mthds$mc2_desc <- mc2_list$mc2_mthd[match(mc2_mthds$mthd_id, mc2_list$mc2_mthd_id)]
+  mc2_mthds_agg2 <- aggregate(mc2_desc ~ acid, mc2_mthds, toString)
+  mc2_mthds_agg$mc2_desc <- mc2_mthds_agg2$mc2_desc[match(mc2_mthds_agg$acid, mc2_mthds_agg2$acid)]
+  setnames(mc2_mthds_agg, "mthd_id", "mc2_mthd_id")
+  
+  #aeid
+  mc3_mthds <- tcplMthdLoad(3,aeids$aeid, type.in)
+  mc3_mthds_agg <- aggregate(mthd_id ~ aeid, mc3_mthds, toString)
+  mc3_list <- tcplMthdList(lvl=3, type=type.in)
+  mc3_mthds$mc3_desc <- mc3_list$mc3_mthd[match(mc3_mthds$mthd_id, mc3_list$mc3_mthd_id)]
+  mc3_mthds_agg2 <- aggregate(mc3_desc ~ aeid, mc3_mthds, toString)
+  mc3_mthds_agg$mc3_desc <- mc3_mthds_agg2$mc3_desc[match(mc3_mthds_agg$aeid, mc3_mthds_agg2$aeid)]
+  setnames(mc3_mthds_agg, "mthd_id", "mc3_mthd_id")
+  
+  mc4_mthds <- tcplMthdLoad(4,aeids$aeid, type.in)
+  mc4_mthds_agg <- aggregate(mthd_id ~ aeid, mc4_mthds, toString)
+  mc4_list <- tcplMthdList(lvl=4, type=type.in)
+  mc4_mthds$mc4_desc <- mc4_list$mc4_mthd[match(mc4_mthds$mthd_id, mc4_list$mc4_mthd_id)]
+  mc4_mthds_agg2 <- aggregate(mc4_desc ~ aeid, mc4_mthds, toString)
+  mc4_mthds_agg$mc4_desc <- mc4_mthds_agg2$mc4_desc[match(mc4_mthds_agg$aeid, mc4_mthds_agg2$aeid)]
+  setnames(mc4_mthds_agg, "mthd_id", "mc4_mthd_id")
+  
+  mc5_mthds <- tcplMthdLoad(5,aeids$aeid, type.in)
+  mc5_mthds_agg <- aggregate(mthd_id ~ aeid, mc5_mthds, toString)
+  mc5_list <- tcplMthdList(lvl=5, type=type.in)
+  mc5_mthds$mc5_desc <- mc5_list$mc5_mthd[match(mc5_mthds$mthd_id, mc5_list$mc5_mthd_id)]
+  mc5_mthds_agg2 <- aggregate(mc5_desc ~ aeid, mc5_mthds, toString)
+  mc5_mthds_agg$mc5_desc <- mc5_mthds_agg2$mc5_desc[match(mc5_mthds_agg$aeid, mc5_mthds_agg2$aeid)]
+  setnames(mc5_mthds_agg, "mthd_id", "mc5_mthd_id")
+  
+  mc6_mthds <- tcplMthdLoad(6,aeids$aeid, type.in)
+  mc6_mthds_agg <- aggregate(mthd_id ~ aeid, mc6_mthds, toString)
+  mc6_list <- tcplMthdList(lvl=6, type=type.in)
+  mc6_mthds$mc6_desc <- mc6_list$mc6_mthd[match(mc6_mthds$mthd_id, mc6_list$mc6_mthd_id)]
+  mc6_mthds_agg2 <- aggregate(mc6_desc ~ aeid, mc6_mthds, toString)
+  mc6_mthds_agg$mc6_desc <- mc6_mthds_agg2$mc6_desc[match(mc6_mthds_agg$aeid, mc6_mthds_agg2$aeid)]
+  setnames(mc6_mthds_agg, "mthd_id", "mc6_mthd_id")
+
+  acid.methods <- merge(aeids, mc2_mthds_agg,by.x = "acid", by.y = "acid")
+
+  mthd36 <- merge (merge( merge(mc3_mthds_agg, mc4_mthds_agg, by = "aeid", all = TRUE ), mc5_mthds_agg, by = "aeid", all = TRUE ), mc6_mthds_agg, by = "aeid", all = TRUE )
+  methods <- merge(acid.methods[,c('aeid','acid','mc2_mthd_id','mc2_desc')], mthd36,by.x = "aeid", by.y = "aeid") 
+  }
+
+methods.tbl.mc <- methods.mc(aeids= neuro.assays, type.in="mc")
+methods.tbl.mc$aenm <- neuro.assays$aenm[match(methods.tbl.mc$aeid, neuro.assays$aeid)]
+
+# add bmad and coff
+mc.bmad <- unique(mc5.neuro[, c('aenm','bmad','coff')])
+setnames(mc.bmad, "bmad","bmad.mc")
+setnames(mc.bmad, "coff","coff.mc")
+
+methods.tbl.mc <- merge(methods.tbl.mc, mc.bmad, by='aenm')
+```
+
+### sc
+```{r warning=FALSE, message=FALSE}
+
+methods.sc <- function(aeids, type.in) {
+  
+  sc2_mthds <- tcplMthdLoad(2,aeids$aeid, type.in)
+  sc2_mthds_agg <- aggregate(mthd_id ~ aeid, sc2_mthds, toString)
+  
+  sc2_list <- tcplMthdList(lvl=2, type=type.in)
+  sc2_mthds$sc2_desc <- sc2_list$sc2_mthd[match(sc2_mthds$mthd_id, sc2_list$sc2_mthd_id)]
+  sc2_mthds_agg2 <- aggregate(sc2_desc ~ aeid, sc2_mthds, toString)
+  sc2_mthds_agg$sc2_desc <- sc2_mthds_agg2$sc2_desc[match(sc2_mthds_agg$aeid, sc2_mthds_agg2$aeid)]
+  setnames(sc2_mthds_agg, "mthd_id", "sc2_mthd_id")
+
+}
+methods.tbl.sc <- methods.sc(aeids= neuro.assays, type.in="sc")
+
+# deduce bmad and coff from acute sc (not in invitrodb 3.5)
+sc2.neuro[, n.chem := .N, by=aenm]
+sc2.mthds <- unique(sc2.neuro[, c('aenm','aeid','bmad','coff','n.chem', 'assay_type')])
+sc2.mthds[, coff.mthd := coff/bmad]
+sc2.mthds[, coff.mthd2 := round(coff.mthd,1)]
+sc2.mthds[coff==30, sc2_desc := paste0('ow_bmad_nwells, ','pc30')]
+sc2.mthds[coff==23, sc2_desc := paste0('ow_bmad_nwells, ','pc25')]
+sc2.mthds[is.na(sc2_desc), sc2_desc := paste0('ow_bmad_nwells, ','bmad',coff.mthd2)]
+setnames(sc2.mthds, "bmad","bmad.sc")
+setnames(sc2.mthds, "coff","coff.sc")
+
+# bind new ids to desc
+methods.tbl.mc.sc <- merge(methods.tbl.mc, sc2.mthds[, c('aeid','sc2_desc','bmad.sc','coff.sc')], by='aeid', all.x=T )
+
+```
+
+# 3. Chemical Overlap
+```{r warning=FALSE, message=FALSE}
+mc.acute <- unique(mc5.neuro[assay_type == "acute", dsstox_substance_id])
+mc.dev <- unique(mc5.neuro[assay_type == "dev", dsstox_substance_id])
+sc.acute <- unique(sc2.neuro[assay_type == "acute", dsstox_substance_id])
+sc.dev <- unique(sc2.neuro[assay_type == "dev", dsstox_substance_id])
+
+mc.sc.acute <- unique(c(mc.acute, sc.acute))
+mc.sc.dev <- unique(c(mc.dev, sc.dev))
+mc.acute.dev <- intersect(mc.acute, mc.dev) #154
+chems.inter.acute.dev <- intersect(mc.sc.acute, mc.sc.dev) #243
+
+```
+
+Total number of chemicals tested in acute and dev mc screen: `r length(mc.acute.dev)`
+Total number of chemicals tested in acute and dev (sc + mc screen): `r length(chems.inter.acute.dev)`
+
+## Venn diagram
+### Supp Figure 1: Venn: SC acute and dev overlap
+```{r warning=FALSE, message=FALSE}
+sc.acute.dev <- list("SC Acute" = sc.acute, "SC Dev" = sc.dev)
+venn.diagram(sc.acute.dev, "figures/Supp_Fig1B_overlap_SC_acute_dev.png",
+             main = "Overlap of SC acute and dev chemicals",
+             main.pos = c(0.5, 0.80),
+             main.just = c(0.5, 1),
+             main.cex = 1.5,
+             fill=c("slateblue", "darkred"),
+             cat.cex = c(1.5),
+             main.fontface = "bold",
+             #cat.fontface = "bold",
+             alpha=c(0.5,0.5),
+             margin = 0.2,
+             cat.pos=c(315, 45),
+             cat.dist = c(0.03, 0.03),
+             output = TRUE,
+             height = 2500,
+             width = 2500,
+             scaled = TRUE,
+             lwd = 4)
+```
+
+### Supp Figure 1: Venn: MC acute and dev overlap
+```{r warning=FALSE, message=FALSE}
+mc.acute.dev.venn <- list("MC Acute" = mc.acute, "MC Dev" = mc.dev)
+venn.diagram(mc.acute.dev.venn, "figures/Supp_Fig1B_overlap_MC_acute_dev.png",
+             main = "Overlap of MC acute and dev chemicals",
+             main.pos = c(0.5, 0.80),
+             main.just = c(0.5, 1),
+             main.cex = 1.5,
+             fill=c("slateblue", "darkred"),
+             cat.cex = c(1.5),
+             main.fontface = "bold",
+             #cat.fontface = "bold",
+             alpha=c(0.5,0.5),
+             margin = 0.2,
+             cat.pos=c(315, 45),
+             cat.dist = c(0.03, 0.03),
+             output = TRUE,
+             height = 2500,
+             width = 2500,
+             scaled = TRUE,
+             lwd = 4)
+```
+
+### Supp Figure 1: Venn: MC + SC acute and dev overlap
+```{r warning=FALSE, message=FALSE}
+mc.sc.acute.dev <- list("SC Acute" = mc.sc.acute, "SC Dev" = mc.sc.dev)
+venn.diagram(mc.sc.acute.dev, "figures/Supp_Fig1B_overlap_MC_SC_acute_dev.png",
+             main = "Overlap of MC + SC acute and dev chemicals",
+             main.pos = c(0.5, 0.80),
+             main.just = c(0.5, 1),
+             main.cex = 1.5,
+             fill=c("slateblue", "darkred"),
+             cat.cex = c(1.5),
+             main.fontface = "bold",
+             #cat.fontface = "bold",
+             alpha=c(0.5,0.5),
+             margin = 0.2,
+             cat.pos=c(315, 45),
+             cat.dist = c(0.03, 0.03),
+             output = TRUE,
+             height = 2500,
+             width = 2500,
+             scaled = TRUE,
+             lwd = 4)
+
+```
+
+# 4. Hitcall Concordance
+
+## Add selective activity filter
+```{r warning=FALSE, message=FALSE}
+
+# mc cyto data-------------------------------------------------------------
+cyto.aeid<- c(2540,2541, 2529, 2530)
+mc5.neuro[, is.cyto := 0]
+mc5.neuro[aeid %in% cyto.aeid, is.cyto := 1]
+
+# identify cyto coff by min cyto between LDH and AB for each assay type
+cyto.hits <- mc5.neuro[is.cyto==1 & hitc==1,]
+cyto.hits[, cyto.coff := min(modl_ga, na.rm=T), by=c('chnm','assay_type')]
+cyto.hits.sum <- unique(cyto.hits[, c('chnm','assay_type','cyto.coff')])
+
+mc5.neuro <- merge(mc5.neuro, cyto.hits.sum, by=c('chnm','assay_type'), all.x=T)
+
+# add classification
+mc5.neuro[, sel.score := cyto.coff-modl_ga]
+mc5.neuro[, hitc.sel := ifelse(sel.score>0.3,1,0)]
+mc5.neuro[hitc==1 & is.na(cyto.coff), hitc.sel := 1]
+mc5.neuro[is.na(hitc.sel), hitc.sel := 0]
+mc5.neuro[, hitc.non.sel := ifelse(hitc==1 & hitc.sel==0,1,0)]
+
+# sc cyto data-------------------------------------------------------------
+
+sc2.neuro[, is.cyto := 0]
+sc2.neuro[aeid %in% cyto.aeid, is.cyto := 1]
+
+# identify cyto coff by AB activity for each assay type (appears to be issues with LDH endpoint for sc so not going to use it as a benchmark)
+cyto.hits <- sc2.neuro[is.cyto==1 & hitc==1,]
+cyto.hits[, cyto.hit := 1]
+cyto.hits[, cyto.sum := sum(cyto.hit), by=chnm]
+cyto.hits[, cyto.coff := ifelse(cyto.sum>=1,1,0), by=chnm]
+cyto.hits.sum <- unique(cyto.hits[, c('chnm','assay_type','cyto.coff')])
+
+sc2.neuro <- merge(sc2.neuro, cyto.hits.sum, by=c('chnm','assay_type'), all.x=T)
+
+# add classification
+sc2.neuro[, hitc.sel := ifelse(hitc==1 & cyto.coff==0,1,0)]
+sc2.neuro[hitc==1 & is.na(cyto.coff), hitc.sel := 1]
+sc2.neuro[, hitc.non.sel := ifelse(hitc==1 & hitc.sel==0,1,0)]
+```
+
+## rbind MC + SC data
+```{r warning=FALSE, message=FALSE}
+
+# combine sc and mc tables
+mc5.neuro$screen <- "mc"
+sc2.neuro$screen <- "sc"
+df <- rbind(mc5.neuro, sc2.neuro, fill=T)
+
+# only overlapping chems
+chems.inter.acute.dev <- intersect(mc.sc.acute, mc.sc.dev)
+df <- df[dsstox_substance_id %in% chems.inter.acute.dev,]
+df[, key := paste0(chnm,'_',assay_type,'_',aeid,'_',screen)]
+
+# exclude sc chemicals that were screened in mc for each assay--------------------------------------------
+# acute
+sc.acute <- df[screen %in% "sc" & assay_type %in% "acute", dsstox_substance_id]
+mc.acute <- df[screen %in% "mc" & assay_type %in% "acute", dsstox_substance_id]
+inter.acute <- intersect(sc.acute, mc.acute)
+exclude.acute <- df[dsstox_substance_id %in% inter.acute & assay_type %in% "acute" & screen %in% "sc",]
+df <- df[!key %in% exclude.acute$key,]
+
+# dev
+sc.dev <- df[screen %in% "sc" & assay_type %in% "dev", dsstox_substance_id]
+mc.dev<- df[screen %in% "mc" & assay_type %in% "dev", dsstox_substance_id]
+inter.dev <- intersect(sc.dev, mc.dev)
+exclude.dev <- df[dsstox_substance_id %in% inter.dev & assay_type %in% "dev" & screen %in% "sc",]
+df <- df[!key %in% exclude.dev$key,]
+
+# exposure chemical overlap for mc + sc + acute + dev
+mc.sc.sum.chem <- unique(df[grep('firing_rate',aenm), c('chnm','dsstox_substance_id', 'assay_type','screen')])
+#mc.sc.sum.chem$is.test <- 1
+mc.sc.chem.wide <- as.data.table(dcast(mc.sc.sum.chem,
+                  chnm + dsstox_substance_id ~ assay_type, value.var="screen"))
+
+```
+
+## Add activity type categories
+```{r warning=FALSE, message=FALSE, error=TRUE}
+
+# updated endpoint categories based on manual curation by KC on 07/05/2023
+end.cat <- as.data.table(read.xlsx('input/Assay_endpoint_cat_desc_June2023.xlsx'))
+end.cat$tcpl.fit.dir <- "down"
+end.cat$tcpl.fit.dir <- end.cat[grep("_up",aenm), tcpl.fit.dir := "up" ]
+end.cat[, use.me := ifelse(aenm %in% df$aenm,1,0)]
+
+# table for supp
+end.cat.tbl <- end.cat[order(use.me,aenm, decreasing=T)]
+end.cat.tbl$assay_type <- "dev"
+end.cat.tbl[grep("acute",aenm), assay_type := "acute"]
+end.cat.tbl[, screen_sc := ifelse(aeid %in% sc2.neuro$aeid, 1,0)]
+end.cat.tbl[, screen_mc := ifelse(aeid %in% mc5.neuro$aeid, 1,0)]
+end.cat.tbl$Comments <- NULL
+end.cat.tbl$Category2 <- NULL
+
+df$category <- end.cat$Category[match(df$aeid, end.cat$aeid)]
+df$dir <- end.cat$Activity.direction[match(df$aeid, end.cat$aeid)]
+unique(df[, c('aenm','category')])
+unique(df[, c('aenm','dir')])
+
+df <- df[!(assay_type %in% "dev" & dir %in% "Increase"),]
+dev.up.aeid <- c(2495,2497,2499,2501,2503,2505,2507,2509,2511,2513,2515,2517,2519,2521,2523,2525,2527) # exclude up endpoints in MEA NFA 
+df <- df[!aeid %in% dev.up.aeid,]
+unique(df$aenm)
+```
+
+## MFR endpoint concordance (selective)
+```{r warning=FALSE, message=FALSE}
+
+mfr.aeid <- c(2456,2457,2494,2495)
+df.mfr <- df[aeid %in% mfr.aeid,]
+unique(df.mfr$aenm)
+
+# add hitsum column by  assay type (acute or dev)
+df.mfr[, hitsum := sum(hitc.sel), by=c('dsstox_substance_id','assay_type')]
+hitsum.tbl <- unique(df.mfr[dsstox_substance_id %in% chems.inter.acute.dev,
+                        c('chnm','dsstox_substance_id','assay_type','hitsum')])
+
+# output summary table of hitsum for overlapping chems
+hitsum.tbl.wide <- as.data.table(dcast(hitsum.tbl,
+                  chnm + dsstox_substance_id ~ assay_type, value.var="hitsum"))
+hitsum.tbl.wide[, acute.active := ifelse(acute==0,0,1)]
+hitsum.tbl.wide[, dev.active := ifelse(dev==0,0,1)]
+hitsum.tbl.wide[, concor.overall := ifelse(acute.active==dev.active,1,0)]
+
+hitsum.tbl.wide[, acute.inactive := ifelse(acute==0,1,0)]
+hitsum.tbl.wide[, dev.inactive := ifelse(dev==0,1,0)]
+hitsum.tbl.wide[, concor.active := ifelse(acute.active==1&dev.active==1,1,0)]
+hitsum.tbl.wide[, concor.inactive := ifelse(acute.inactive==1&dev.inactive==1,1,0)]
+
+# sum columns
+mfr.sum <- hitsum.tbl.wide[, lapply(.SD, sum, na.rm=T), .SDcols=c('acute.active','dev.active','concor.active','acute.inactive','dev.inactive','concor.inactive','concor.overall')]
+total.inter.chems <- length(chems.inter.acute.dev)
+mfr.sum[, concor.perc := concor.overall/total.inter.chems*100]
+mfr.sum
+
+# Cohen's Kappa inter-rater reliability
+# Contingency table
+xtab <- table(hitsum.tbl.wide$acute.active, hitsum.tbl.wide$dev.active)
+
+# Descriptive statistics
+diagonal.counts <- diag(xtab)
+N <- sum(xtab)
+row.marginal.props <- rowSums(xtab)/N
+col.marginal.props <- colSums(xtab)/N
+# Compute kappa (k)
+Po <- sum(diagonal.counts)/N
+Pe <- sum(row.marginal.props*col.marginal.props)
+k <- (Po - Pe)/(1 - Pe)
+k
+
+
+```
+
+
+### Venn: MFR active overlap
+```{r warning=FALSE, message=FALSE, error=TRUE}
+mfr.active <- list("Acute Active" = hitsum.tbl.wide[acute.active==1,dsstox_substance_id], "Dev Active" = hitsum.tbl.wide[dev.active==1,dsstox_substance_id])
+
+venn.diagram(mfr.active, "figures/Fig2B_Overlap_MFR_sel_active.png", 
+             main = "Overlap of MFR active in acute and dev (MC + SC)", 
+             main.pos = c(0.5, 0.80), 
+             main.just = c(0.5, 1),
+             main.cex = 1.5, 
+             fill=c("slateblue", "darkred"), 
+             cat.cex = c(1.5),
+             main.fontface = "bold",
+             #cat.fontface = "bold",
+             alpha=c(0.5,0.5), 
+             margin = 0.2,
+             cat.pos=c(315, 45), 
+             cat.dist = c(0.03, 0.03), 
+             output = TRUE, 
+             height = 2500, 
+             width = 2500, 
+             scaled = TRUE, 
+             lwd = 4)
+
+# which were both
+both.tbl <- hitsum.tbl.wide[ acute.active==1 & dev.active==1,]
+# were any cyto
+explore <- df[is.cyto==1 & chnm %in% both.tbl$chnm & hitc==1,]
+unique(explore$chnm)
+
+# explore activity of the 50 chemicals that were active in the nfa but not acute
+acute.mfr <- hitsum.tbl.wide[dev.active==0 & acute.active==1,dsstox_substance_id]
+explore <- df[dsstox_substance_id %in% acute.mfr & aeid %in% mfr.aeid & assay_type=="dev", c('chnm','aenm','hitc','hitc.sel') ]
+explore[, hitsum := sum(hitc), by=chnm]
+explore.sum <- unique(explore[, c('chnm','hitsum','hitc.sel')])
+#table(explore.sum$hitsum)
+
+# were any of the chemicals that were sel active in mfr acute, cytotoxic in acute?
+explore <- df[dsstox_substance_id %in% acute.mfr & is.cyto==1 & assay_type=="acute", c('chnm','aenm','hitc') ]
+explore[, hitsum := sum(hitc), by=chnm]
+explore.sum <- unique(explore[, c('chnm','hitsum')])
+#table(explore.sum$hitsum)
+#write.csv(explore.sum, 'output/Chem_only_acute_w_cyto_dev_hits.csv')
+
+# were any of the chemicals that were sel active in mfr acute, active in the NFA
+explore <- df[dsstox_substance_id %in% acute.mfr & assay_type=="dev" & hitc==1, c('chnm','aenm','hitc','is.cyto') ]
+unique(explore$chnm)
+# how many were cyto
+explore2 <- explore[is.cyto==1,]
+unique(explore2$chnm)
+
+# were any of the chemicals that were sel active in mfr acute, cytotoxic in nfa?
+explore <- df[dsstox_substance_id %in% acute.mfr & is.cyto==1 & assay_type=="dev", c('chnm','aenm','hitc') ]
+explore[, hitsum := sum(hitc), by=chnm]
+explore.sum <- unique(explore[, c('chnm','hitsum')])
+table(explore.sum$hitsum)
+#write.csv(explore.sum, 'output/Chem_only_acute_w_cyto_dev_hits.csv')
+
+# were any of these chemicals that were active in mfr acute, but did not demonstrate cyto in nfa, active in other nfa endpoints?
+no.cyto <- unique(explore.sum[hitsum==0,chnm])
+explore <- df[chnm %in% no.cyto & is.cyto==0 & assay_type=="dev", c('chnm','aenm','hitc','hitc.sel','screen') ]
+explore[, hitsum := sum(hitc.sel), by=chnm]
+explore.sum <- unique(explore[, c('chnm','hitsum')])
+#table(explore.sum$hitsum)
+
+# can we call 2 hits equivocal with 14 NFA endpoints? Look at plots
+chem.explore <- c("Tris(1,3-dichloro-2-propyl) phosphate", "Fenamiphos")
+graph <- df[hitc==1 & chnm %in% chem.explore & assay_type %in%  "dev",]
+#tcplPlotM4ID(graph$m4id, lvl=6)
+# based on plots I think it makes sense to say only 1 hit is equivocal, although these cases were pretty borderline. It does look like something was going on at only the highest concentration.
+
+# did any of the 18 chemicals that were active in mfr acute not active in nfa demonstrate increased mfr?
+no.nfa.act <- explore.sum[hitsum<3,chnm]
+explore <- df[chnm %in% no.nfa.act & aeid %in% mfr.aeid & assay_type=="acute", c('chnm','aenm','hitc','hitc.sel','screen','hitsum') ]
+explore2 <- explore[hitc==1,]
+table(explore2$aenm)
+explore.sum <- unique(explore[, c('chnm','hitsum')])
+#table(explore.sum$aenm)
+
+# mean ac50 of the 11 chemicals that were active in only nfa
+dev.mfr <- hitsum.tbl.wide[dev.active==1 & acute.active==0,dsstox_substance_id]
+
+explore <- df[dsstox_substance_id %in% dev.mfr & is.cyto==0 & aenm %in% 'CCTE_Shafer_MEA_dev_firing_rate_mean_dn' & assay_type=="dev", c('chnm','aenm','hitc','hitc.sel','screen','modl_ga','sel.score') ]
+mean(explore$modl_ga, na.rm=T)
+sd(explore$modl_ga, na.rm=T)
+mean(explore$sel.score, na.rm=T)
+sd(explore$sel.score, na.rm=T)
+
+# were the chemicals that were active in nfa mfr but not acute, also cytotoxic in nfa?
+dev.mfr <- hitsum.tbl.wide[dev.active==1 & acute.active==0,dsstox_substance_id]
+
+explore <- df[dsstox_substance_id %in% dev.mfr & is.cyto==1 & assay_type=="dev", c('chnm','aenm','hitc','screen','modl_ga') ]
+explore[, hitsum := sum(hitc), by=chnm]
+explore.sum <- unique(explore[, c('chnm','hitsum')])
+# table(explore.sum$hitsum)
+# write.csv(explore.sum, 'output/Chem_only_dev_w_cyto_dev_hits.csv')
+
+# explore..
+explore <- df[dsstox_substance_id %in% dev.mfr & is.cyto==1 & assay_type=="acute", c('chnm','aenm','hitc','assay_type','screen') ]
+explore[, hitsum := sum(hitc), by=chnm]
+explore.sum <- unique(explore[, c('chnm','hitsum')])
+# table(explore.sum$hitsum)
+
+# were the chemicals only active in the nfa mfr, active in other acute endpoints?
+explore <- df[dsstox_substance_id %in% dev.mfr & assay_type=="acute" & hitc==1,]
+
+# how many acute MFR were up versus down?
+explore <- df[dsstox_substance_id %in% acute.mfr & hitc==1 & assay_type %in% "acute" & aeid %in% mfr.aeid, c('chnm','aenm','hitc','hitc.sel','assay_type','screen','dir')]
+table(explore$aenm)
+acute.up.only <- explore[dir %in% "Increase",chnm]
+
+# were the chemicals that increased activity in the acute, cytotoxic in the NFA?
+explore <- df[chnm %in% acute.up.only,]
+
+explore <- df[chnm %in% acute.up.only & is.cyto==1 & assay_type=="dev", c('chnm','aenm','hitc','assay_type','screen')  ]
+explore[, hitsum := sum(hitc), by=chnm]
+explore.sum <- unique(explore[, c('chnm','hitsum')])
+table(explore.sum$hitsum)
+
+# were there any other acute MFR up hits that were also active in NFA MFR?
+explore <- df[hitc==1 & assay_type %in% "dev" & chnm %in% acute.up.only,]
+
+explore <- df[hitc==1 & assay_type %in% "dev" & aeid %in% mfr.aeid & chnm %in% acute.up.only,]
+
+explore <- df[hitc==1 & assay_type %in% "acute" & aeid %in% mfr.aeid & dir %in% "Increase",]
+
+# test <- df[chnm %in% "Chlorpromazine hydrochloride", c('chnm','aenm','hitc','modl_ga')]
+# test <- df[chnm %in% "Mancozeb", c('chnm','aenm','hitc','modl_ga','screen','assay_type')]
+# test <- df[chnm %in% "Carbofuran", c('chnm','aenm','hitc','modl_ga','screen','assay_type')]
+
+# compare the difference between mean cyto and mean MFR ac50's for the 9 chemicals that were selectively active in the MFR NFA
+explore <- df[dsstox_substance_id %in% dev.mfr & is.cyto==1 & assay_type=="dev", c('chnm','aenm','hitc','screen') ]
+nfa.mfr.cyto <- explore[hitc==1,]
+nfa.mfr.cyto.df <- df[chnm %in% nfa.mfr.cyto$chnm & aeid %in%  mfr.aeid & hitc==1 & assay_type=="dev", ]
+mean(nfa.mfr.cyto.df$modl_ga)
+sd(nfa.mfr.cyto.df$modl_ga)
+# find cyto mean ac50 for these chems
+nfa.mfr.cyto.df2 <- df[chnm %in% nfa.mfr.cyto$chnm & aeid %in% cyto.aeid & hitc==1 & assay_type=="dev", ]
+mean(nfa.mfr.cyto.df2$modl_ga)
+sd(nfa.mfr.cyto.df2$modl_ga)
+# compare this to rest of chemicals active in NFA
+explore <- df[aeid %in% mfr.aeid & assay_type=="dev" &
+                !chnm %in% nfa.mfr.cyto.df$chnm, c('chnm','aenm','hitc','screen') ]
+nfa.mfr.other <- explore[hitc==1,]
+nfa.mfr.other.df <- df[chnm %in% nfa.mfr.other$chnm & aeid %in%  mfr.aeid & hitc==1 & assay_type=="dev", ]
+mean(nfa.mfr.other.df$modl_ga)
+sd(nfa.mfr.other.df$modl_ga)
+# find cyto mean ac50 for these chems
+nfa.mfr.other.df2 <- df[chnm %in% nfa.mfr.other.df$chnm & aeid %in% cyto.aeid & hitc==1 & assay_type=="dev", ]
+mean(nfa.mfr.other.df2$modl_ga, na.rm=T)
+sd(nfa.mfr.cyto.df2$modl_ga)
+
+# print plots for 9 selectively active NFA MFR
+graph <- nfa.mfr.cyto.df
+
+# graphics.off()
+# pdf(file=paste('figures/Tcpl_plots_NFA_MFR_9chem_hits',
+#                format(Sys.Date(),
+#                       "%y%m%d.pdf"),
+#                sep="_"),
+#     height=6,
+#     width=10,
+#     pointsize=10)
+# for (a in graph$m5id){
+#   tcplPlotM4ID(graph[m5id==a]$m4id, lvl=6)
+#   mtext(paste(unique(graph[m5id==a]$aenm)), outer=FALSE, cex=1, line=1.5, adj=0)
+# }
+# graphics.off()
+
+```
+
+## Chemical concordance (all MEA endpoints, mc + sc, including cyto)
+```{r warning=FALSE, message=FALSE}
+
+all.aenm <- df
+
+# add hitsum column by screening type (mc or sc) and assay type (acute or dev)
+all.aenm[, hitsum := sum(hitc), by=c('dsstox_substance_id','assay_type')]
+
+hitsum.tbl <- unique(all.aenm[dsstox_substance_id %in% chems.inter.acute.dev,
+                        c('chnm','dsstox_substance_id','assay_type','hitsum')])
+
+hit2 <- all.aenm[hitsum==2 & hitc==1,c('chnm','aenm','hitc','modl_ga','assay_type','screen')]
+hit1 <- all.aenm[hitsum==1 & hitc==1,c('chnm','aenm','hitc','modl_ga','assay_type','screen')]
+
+# output summary table of hitsum for overlapping chems
+hitsum.tbl.wide <- as.data.table(dcast(hitsum.tbl,
+                  chnm + dsstox_substance_id ~ assay_type, value.var="hitsum"))
+hitsum.tbl.wide[, acute.active := ifelse(acute==0,0,1)]
+hitsum.tbl.wide[, dev.active := ifelse(dev==0,0,1)]
+hitsum.tbl.wide[, concor.overall := ifelse(acute.active==dev.active,1,0)]
+
+hitsum.tbl.wide[, acute.inactive := ifelse(acute==0,1,0)]
+hitsum.tbl.wide[, dev.inactive := ifelse(dev==0,1,0)]
+hitsum.tbl.wide[, concor.active := ifelse(acute.active==1&dev.active==1,1,0)]
+hitsum.tbl.wide[, concor.inactive := ifelse(acute.inactive==1&dev.inactive==1,1,0)]
+
+# sum columns
+all.aenm.sum <- hitsum.tbl.wide[, lapply(.SD, sum, na.rm=T), .SDcols=c('acute.active','dev.active','concor.active','acute.inactive','dev.inactive','concor.inactive','concor.overall')]
+total.inter.chems <- length(chems.inter.acute.dev)
+all.aenm.sum[, concor.perc := concor.overall/total.inter.chems*100]
+all.aenm.sum
+
+```
+
+### Venn: All endpoint active overlap
+```{r warning=FALSE, message=FALSE, error=TRUE}
+all.aenm.active <- list("Acute Active" = hitsum.tbl.wide[acute.active==1,dsstox_substance_id], "Dev Active" = hitsum.tbl.wide[dev.active==1,dsstox_substance_id])
+
+venn.diagram(all.aenm.active, "figures/Fig2C_overlap_all_MEA_aenm_active.png", 
+             main = "Overlap of MFR active in acute and dev (MC + SC)", 
+             main.pos = c(0.5, 0.80), 
+             main.just = c(0.5, 1),
+             main.cex = 1.5, 
+             fill=c("slateblue", "darkred"), 
+             cat.cex = c(1.5),
+             main.fontface = "bold",
+             #cat.fontface = "bold",
+             alpha=c(0.5,0.5), 
+             margin = 0.2,
+             cat.pos=c(315, 45), 
+             cat.dist = c(0.03, 0.03), 
+             output = TRUE, 
+             height = 2500, 
+             width = 2500, 
+             scaled = TRUE, 
+             lwd = 4)
+
+# Cohen's Kappa inter-rater reliability
+
+# Contingency table
+xtab <- table(hitsum.tbl.wide$acute.active, hitsum.tbl.wide$dev.active)
+
+# Descriptive statistics
+diagonal.counts <- diag(xtab)
+N <- sum(xtab)
+row.marginal.props <- rowSums(xtab)/N
+col.marginal.props <- colSums(xtab)/N
+# Compute kappa (k)
+Po <- sum(diagonal.counts)/N
+Pe <- sum(row.marginal.props*col.marginal.props)
+k <- (Po - Pe)/(1 - Pe)
+k
+
+
+```
+
+## Cyto endpoint concordance
+```{r warning=FALSE, message=FALSE}
+
+df.cyto <- df[aeid %in% cyto.aeid,]
+unique(df.cyto$aenm)
+# check the chemical overlap between acute and nfa in case missing cyto endpoints
+df.cyto.acute <- unique(df.cyto[assay_type %in% "acute",dsstox_substance_id])
+df.dev.acute <- unique(df.cyto[assay_type %in% "dev",dsstox_substance_id])
+length(intersect(df.cyto.acute, df.dev.acute)) #243, all data available
+
+# add hitsum column by screening type (mc or sc) and assay type (acute or dev)
+df.cyto[, hitsum := sum(hitc), by=c('chnm','assay_type')]
+df.cyto[, is.active := ifelse(hitsum==0,0,1)]
+
+hitsum.tbl <- unique(df.cyto[dsstox_substance_id %in% chems.inter.acute.dev,
+                        c('chnm','dsstox_substance_id','assay_type','is.active')])
+
+# output summary table of hitsum for overlapping chems
+hitsum.tbl.wide <- as.data.table(dcast(hitsum.tbl,
+                  chnm + dsstox_substance_id ~ assay_type, value.var="is.active"))
+hitsum.tbl.wide[, concor.overall := ifelse(acute==dev,1,0)]
+hitsum.tbl.wide[, acute.inactive := ifelse(acute==0,1,0)]
+hitsum.tbl.wide[, dev.inactive := ifelse(dev==0,1,0)]
+hitsum.tbl.wide[, concor.active := ifelse(acute==1 & dev==1,1,0)]
+hitsum.tbl.wide[, concor.inactive := ifelse(acute.inactive==1 & dev.inactive==1,1,0)]
+
+# sum columns
+cyto.sum <- hitsum.tbl.wide[, lapply(.SD, sum, na.rm=T), .SDcols=c('acute','dev','concor.active','acute.inactive','dev.inactive','concor.inactive','concor.overall')]
+total.inter.chems <- length(chems.inter.acute.dev)
+cyto.sum[, concor.perc := concor.overall/total.inter.chems*100]
+cyto.sum$concor.perc
+
+```
+
+### Venn: Cyto active overlap
+```{r warning=FALSE, message=FALSE, error=TRUE}
+cyto.active <- list("Acute Active" = hitsum.tbl.wide[acute==1,dsstox_substance_id], "Dev Active" = hitsum.tbl.wide[dev==1,dsstox_substance_id])
+
+venn.diagram(cyto.active, "figures/Fig2A_overlap_Cyto_active.png", 
+             main = "Overlap of MFR active in acute and dev (MC + SC)", 
+             main.pos = c(0.5, 0.80), 
+             main.just = c(0.5, 1),
+             main.cex = 1.5, 
+             fill=c("slateblue", "darkred"), 
+             cat.cex = c(1.5),
+             main.fontface = "bold",
+             #cat.fontface = "bold",
+             alpha=c(0.5,0.5), 
+             margin = 0.2,
+             cat.pos=c(315, 45), 
+             cat.dist = c(0.03, 0.03), 
+             output = TRUE, 
+             height = 2500, 
+             width = 2500, 
+             scaled = TRUE, 
+             lwd = 4)
+
+# which chemicals were cyto in acute and not nfa
+cyto.acute <- hitsum.tbl.wide[acute==1 & dev==0,]
+# were most only screened in sc?
+explore <- df.cyto[chnm %in% cyto.acute$chnm, c('chnm','aenm','screen','assay_type','hitc','hitsum','modl_ga','flag.length')]
+
+# stats: what was the mean potency of chemicals that were cyto in both assays
+cyto.both.chems <- hitsum.tbl.wide[concor.active==1,chnm]
+cyto.both <- df.cyto[chnm %in% cyto.both.chems, ]
+cyto.both[, all.mc := ifelse(any(screen %in% "sc"),0,1), by=chnm]
+cyto.view <- cyto.both[, c('chnm','aenm','modl_ga','assay_type', 'screen','all.mc')]
+cyto.both <- cyto.both[!all.mc==0,]
+cyto.view <- cyto.view[!all.mc==0,]
+length(unique(cyto.both$chnm))
+
+# dev cyto mean for 12 chemicals that were cyto in both
+median(cyto.both[assay_type %in% "dev", modl_ga], na.rm=T)
+mean(cyto.both[assay_type %in% "dev", modl_ga], na.rm=T)
+sd(cyto.both[assay_type %in% "dev", modl_ga], na.rm=T)
+# acute cyto mean for 12 chemicals that were cyto in both
+median(cyto.both[assay_type %in% "acute", modl_ga], na.rm=T)
+mean(cyto.both[assay_type %in% "acute", modl_ga], na.rm=T)
+sd(cyto.both[assay_type %in% "acute", modl_ga], na.rm=T)
+cyto.both[hitc==1, c('chnm','aenm','modl_ga','assay_type')]
+
+```
+
+### Supp Figure 2: tcpl plots
+```{r warning=FALSE, message=FALSE}
+
+# print plots for Carbofuran and Mancozeb in NFA, which demonstrated selective activity in MFR and not cyto
+chem.int <- c("Carbofuran","Mancozeb")
+chem.int.hits <- df.mfr[chnm %in% chem.int & hitc.sel==1,]
+
+# supplemental Figure 2
+graph <- chem.int.hits
+# tcplPlotM4ID(graph$m4id, lvl=6)
+# 
+# graphics.off()
+# pdf(file=paste('figures/Tcpl_plots_NFA_hit_MFR_manc_carb',
+#                format(Sys.Date(),
+#                       "%y%m%d.pdf"),
+#                sep="_"),
+#     height=6,
+#     width=10,
+#     pointsize=10)
+# for (a in graph$m5id){
+#   tcplPlotM4ID(graph[m5id==a]$m4id, lvl=6)
+#   mtext(paste(unique(graph[m5id==a]$aenm)), outer=FALSE, cex=1, line=1.5, adj=0)
+# }
+# graphics.off()
+```
+
+# 5. Correlation between endpoint categories
+
+## Hitcall (mc only)
+```{r warning=FALSE, message=FALSE}
+# only mc data for chems tested in both
+df.mc <- df[screen %in% "mc" & dsstox_substance_id %in% mc.acute.dev,] #only chemicals screened in mc in acute + nfa
+
+#exclude cyto endpoints
+df.stats <- df.mc[!aeid %in% cyto.aeid,]
+df.stats[, sel.ac50 := modl_ga]
+df.stats[hitc.sel==0, sel.ac50 := NA]
+
+# create cats by screen
+df.stats[, category2 := category]
+df.stats[category %in% "Burst Structure", category2 := "Burst"]
+df.stats[category %in% "Network Synchrony", category2 := "Network"]
+unique(df.stats$category2)
+df.stats[, cat_assay := paste0(category2,"_",assay_type)]
+df.stats[ , cat.hitc.bin := ifelse(any(hitc.sel==1),1,0), by=c('chnm','cat_assay')]
+df.stats[ , cat.ac50.min := quantile(sel.ac50, na.rm=T,0.05), by=c('chnm','cat_assay')]
+
+df.stats2 <- unique(df.stats[, c('chnm','cat_assay','cat.hitc.bin','cat.ac50.min')])
+
+mat.all <- dcast.data.table(df.stats2, chnm ~ cat_assay,
+                            value.var = c('cat.hitc.bin'))
+
+mat.all$chnm <- NULL
+matrix <- as.matrix(mat.all)
+
+#Correlogram
+V <- cor(matrix)
+#write.xlsx(cor_cov, "output/cor_cov_HCI_NFA_matrix.xlsx", rowNames=T)
+
+#Corrplot
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig2C_cat_corr_hitc_sel_mc_only", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width =8, height = 8, unit='in',res = 600)
+corrplot(corr = V, method = "color", tl.col = "black", 
+         #tl.pos = "lt", 
+         diag = F, type='lower', tl.pos='ld', 
+         #tl.srt= 50,
+         cl.align.text = "l", cl.cex = 1.6, tl.cex = 1.6, number.cex = 1, addgrid.col = "grey", cl.pos = "b",
+         order = "hclust", addCoef.col = "black")
+dev.off()
+```
+
+## Potency
+```{r warning=FALSE, message=FALSE}
+
+mat.all <- dcast.data.table(df.stats2, chnm ~ cat_assay,
+                            value.var = c('cat.ac50.min'))
+names(mat.all)
+mat.all[is.na(mat.all),] <- 3
+
+mat.all$chnm <- NULL
+matrix <- as.matrix(mat.all)
+
+#Correlogram
+V <- cor(matrix)
+#write.xlsx(cor_cov, "output/cor_cov_HCI_NFA_matrix.xlsx", rowNames=T)
+
+#Corrplot
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Supp_Fig3_cat_corr_pot", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width =10, height = 10, unit='in',res = 600)
+corrplot(corr = V, method = "color", tl.col = "black", 
+         #tl.pos = "lt", 
+         diag = TRUE, type='lower',
+         cl.align.text = "l", cl.cex = 1.6, tl.cex = 1.6, number.cex = 1, addgrid.col = "grey", cl.pos = "b",
+         order = "hclust", addCoef.col = "black")
+dev.off()
+```
+
+# 6. Potency comparison
+
+## Non-selective potency comparison
+```{r warning=FALSE, message=FALSE}
+
+# only mc data for chems tested in both
+df.mc <- df[screen %in% "mc" & dsstox_substance_id %in% mc.acute.dev,] #only chemicals screened in mc in acute + nfa
+
+plot <- ggplot(df.mc, aes(x=as.factor(assay_type), y= modl_ga))+
+  geom_boxplot()+
+  geom_jitter(width=0.2, alpha=0.3)+
+  theme_classic()+
+  xlab("")+
+  ylab("Potency (log10-AC50-uM)")+
+  scale_x_discrete(labels=c("Acute","NFA"))+
+  theme(text = element_text(size = 20))+
+  ggtitle("Non-selective Activity")+
+  theme(plot.title = element_text(hjust = 0.5))
+plot
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig3A_potency_binary_compare", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width =5, height = 4.8, unit='in',res = 600)
+plot
+dev.off()
+
+plot <- ggplot(df.mc, aes(x = modl_ga, fill=as.factor(assay_type)))+
+  geom_density(alpha=0.2)
+
+plot  
+
+ks.test(df.mc[assay_type %in% "acute",modl_ga], "pnorm") # not normal
+ks.test(df.mc[assay_type %in% "dev",modl_ga], "pnorm") # not normal
+
+median(df.mc[assay_type %in% "acute",modl_ga], na.rm=T)
+median(df.mc[assay_type %in% "dev",modl_ga], na.rm=T)
+
+wilcox.test(modl_ga ~ assay_type, data=df.mc) 
+# 	Wilcoxon rank sum test with continuity correction
+# 
+# data:  modl_ga by assay_type
+# W = 749128, p-value = 0.4794
+# alternative hypothesis: true location shift is not equal to 0
+# p>0.05, accept the null, acute and nfa are identical
+
+
+# stats, use two sample KS test given that data are not noramlly distrubted
+#ks.test(df.mc[assay_type %in% "acute",modl_ga], df.mc[assay_type %in% "dev",modl_ga] ) 
+# 	Two-sample Kolmogorov-Smirnov test
+# 
+# data:  df.mc[assay_type %in% "acute", modl_ga] and df.mc[assay_type %in% "dev", modl_ga]
+# D = 0.078003, p-value = 0.00139
+# alternative hypothesis: two-sided
+
+```
+
+## Selective potency comparison
+```{r warning=FALSE, message=FALSE}
+
+plot <- ggplot(df.mc[hitc.sel==1,], aes(x=as.factor(assay_type), y= modl_ga))+
+  geom_boxplot()+
+  geom_jitter(width=0.2, alpha=0.3)+
+  theme_classic()+
+  xlab("")+
+  ylab("Potency (log10-AC50-uM)")+
+  scale_x_discrete(labels=c("Acute","NFA"))+
+  theme(text = element_text(size = 20))+
+  ggtitle("Selective Activity")+
+  theme(plot.title = element_text(hjust = 0.5))
+plot
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig3B_potency_binary_compare_selective", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width =5, height = 4.8, unit='in',res = 600)
+plot
+dev.off()
+
+plot <- ggplot(df.mc[hitc.sel==1,], aes(x = modl_ga, fill=as.factor(assay_type)))+
+  geom_density(alpha=0.2)
+
+plot  
+
+wilcox.test(modl_ga ~ assay_type, data=df.mc[hitc.sel==1,]) 
+# 	Wilcoxon rank sum test with continuity correction
+# 
+# data:  modl_ga by assay_type
+# W = 245476, p-value = 4.113e-08
+# alternative hypothesis: true location shift is not equal to 0
+
+median(df.mc[hitc.sel==1 & assay_type %in% "acute",modl_ga], na.rm=T)
+median(df.mc[hitc.sel==1 & assay_type %in% "dev",modl_ga], na.rm=T)
+
+
+# stats, use two sample KS test given that data are not noramlly distrubted
+# ks.test(df.mc[hitc.sel==1 & assay_type %in% "acute",modl_ga], df.mc[hitc.sel==1 & assay_type %in% "dev",modl_ga] ) 
+# 	Two-sample Kolmogorov-Smirnov test
+# D = 0.067536, p-value = 0.004307
+# alternative hypothesis: two-sided
+# P<0.05, reject the null hypothesis, evidence to say that the two distributions are not the same
+
+# Mean difference of potency between nfa and acute
+mean.acute <- mean(df.mc[hitc.sel==1 & assay_type %in% "acute",modl_ga], na.rm=T)
+mean.dev <- mean(df.mc[hitc.sel==1 & assay_type %in% "dev",modl_ga], na.rm=T)
+mean.acute-mean.dev
+
+```
+
+## Linear potency comparison (non-selective)
+```{r warning=FALSE, message=FALSE}
+
+df.mc[, min.5perc := quantile(modl_ga, 0.05, na.rm=T), by=c('chnm','assay_type')]
+df.mc.sum <- unique(df.mc[, c('chnm','min.5perc','assay_type')])
+df.mc.sum[chnm %in% "4-(4-Chlorophenyl)-4-hydroxy-N,N-dimethyl-alpha,alpha-diphenylpiperidine-1-butyramide monohydrochloride", chnm := "Loperamide"]
+
+df.mc.wide <- dcast.data.table(df.mc.sum, chnm ~ assay_type,
+                            value.var = c('min.5perc'))
+df.mc.wide[, diff := acute-dev]
+df.mc.wide[, diff.abs := abs(diff)]
+df.mc.wide[diff.abs>0.5, chnm2 := chnm]
+
+p <- ggplot(data = df.mc.wide, aes(y=acute, x=dev, label=chnm2))+
+  geom_point(size=2)+
+  geom_smooth(method="lm", se=F, color="lightgreen")+
+  ylab("AcN potency (log10-AC50-uM)")+
+  xlab("NFA potency (log10-AC50-uM)")+
+  geom_abline(slope = 1, intercept = 0)+
+  geom_abline(slope = 1, intercept = 1/2, linetype="dashed")+
+  geom_abline(slope = 1, intercept = -1/2, linetype="dashed")+
+  theme_bw()+
+  coord_cartesian(ylim = c(-3,2),xlim = c(-3,2))+
+  theme(axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20))+
+  geom_text_repel(position = position_nudge_center(center_x = 0, direction="radial"))
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig3C_potency_by_chem_non_sel", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width =9.5, height = 7, unit='in',res = 600)
+p
+dev.off()
+
+#stats
+nrow(df.mc.wide[!is.na(diff.abs),]) #how many chemicals sel active in both
+nrow(df.mc.wide[diff.abs <=0.5,]) #how many chemicals sel active  less than 0.5 absolute diff in log10-ac50
+nrow(df.mc.wide[diff.abs>0.5,]) #how many chemicals sel active more than 0.5 absolute diff in log10-ac50
+nrow(df.mc.wide[diff>0.5,]) 
+test <- df.mc.wide[diff> 0.5,]
+nrow(df.mc.wide[diff< -0.5,]) 
+
+lm.pot <- lm(dev~acute,data=df.mc.wide)
+summary(lm.pot)
+
+df.mc.wide.non.sel <- df.mc.wide
+
+```
+
+## Linear potency comparison (selective)
+```{r warning=FALSE, message=FALSE}
+
+df.mc.sel <- df.mc[hitc.sel==1,]
+df.mc.sel[, min.5perc := quantile(modl_ga, 0.05, na.rm=T), by=c('chnm','assay_type')]
+df.mc.sum <- unique(df.mc.sel[, c('chnm','min.5perc','assay_type')])
+df.mc.sum[chnm %in% "4-(4-Chlorophenyl)-4-hydroxy-N,N-dimethyl-alpha,alpha-diphenylpiperidine-1-butyramide monohydrochloride", chnm := "Loperamide"]
+
+df.mc.wide <- dcast.data.table(df.mc.sum, chnm ~ assay_type,
+                            value.var = c('min.5perc'))
+df.mc.wide[, diff := acute-dev]
+df.mc.wide[, diff.abs := abs(diff)]
+df.mc.wide[diff.abs>0.5, chnm2 := chnm]
+
+p <- ggplot(data = df.mc.wide, aes(y=acute, x=dev, label=chnm2))+
+  geom_point(size=2)+
+  geom_smooth(method="lm", se=F, color="lightgreen")+
+  ylab("AcN potency (log10-AC50-uM)")+
+  xlab("NFA potency (log10-AC50-uM)")+
+  geom_abline(slope = 1, intercept = 0)+
+  geom_abline(slope = 1, intercept = 1/2, linetype="dashed")+
+  geom_abline(slope = 1, intercept = -1/2, linetype="dashed")+
+  theme_bw()+
+  #geom_abline(color="black")+
+  #geom_smooth(method = "lm", se = FALSE, color="blue", formula = y~x)+
+  # stat_poly_eq(data = min.sel.pot.table.inf.rm.lm,
+  #              formula = y~x,
+  #              eq.with.lhs = "italic(hat(y))~'='~",
+  #              aes(label=paste(..eq.label.., ..rr.label.., sep = "~~")),
+  #              parse = TRUE)+
+  coord_cartesian(ylim = c(-3,2),xlim = c(-3,2))+
+  # scale_x_continuous(breaks = seq(-4,3,1))+
+  # scale_y_continuous(breaks = seq(-4, 3,1))+
+  theme(axis.text = element_text(size = 20),
+        axis.title = element_text(size = 20))+
+  geom_text_repel(position = position_nudge_center(center_x = 0, direction="radial"))
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Supp_Fig5_potency_by_chem_sel", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width =9.5, height = 7, unit='in',res = 600)
+p
+dev.off()
+
+#stats
+nrow(df.mc.wide[!is.na(diff.abs),]) #how many chemicals sel active in both
+nrow(df.mc.wide[diff.abs <=0.5,]) #how many chemicals sel active  less than 0.5 absolute diff in log10-ac50
+nrow(df.mc.wide[diff.abs >=0.5,]) #how many chemicals sel active  less than 0.5 absolute diff in log10-ac50
+
+nrow(df.mc.wide[diff.abs>0.5,]) #how many chemicals sel active more than 0.5 absolute diff in log10-ac50
+nrow(df.mc.wide[diff>0.5,]) 
+test <- df.mc.wide[diff> 0.5,]
+nrow(df.mc.wide[diff< -0.5,]) 
+
+lm.pot <- lm(dev~acute,data=df.mc.wide)
+summary(lm.pot)
+
+```
+
+## Potency boxplot by chemical
+### More potent acute
+```{r warning=FALSE, message=FALSE}
+
+# Make one plot showing chems more potent in acute (KC)-----------------------------------
+chem.nfa.pot <- df.mc.wide[diff>0.5,chnm]
+chem.acute.pot <- df.mc.wide[diff< -0.5,chnm]
+
+# include all endpoints but only selective ac50's and cyto hits in a new column
+df.mc[, sel.ac50 := modl_ga]
+df.mc[hitc.sel==0, sel.ac50 := NA]
+#df.mc[aeid %in% cyto.aeid, sel.ac50 := modl_ga]
+
+#plot
+df.plot <- df.mc[chnm %in% chem.acute.pot,]
+df.plot[, chnm_assay := paste0(chnm,"_",assay_type)]
+
+# add metrics
+df.plot[, min.potency.acute := min(sel.ac50[assay_type=="acute"], na.rm=TRUE), by= list(chnm_assay)]
+df.plot[, min.potency.dev := min(sel.ac50[assay_type=="dev"], na.rm=TRUE), by= list(chnm_assay)] 
+df.plot[, min.potency.cyto.acute := min(modl_ga[aeid %in% cyto.aeid & assay_type=="acute"], na.rm=TRUE), by= list(chnm_assay)] 
+df.plot[, min.potency.cyto.dev := min(modl_ga[aeid %in% cyto.aeid & assay_type=="dev"], na.rm=TRUE), by= list(chnm, assay_type)] 
+
+# df.plot[is.infinite(min.potency.acute), min.potency.acute := 4]
+# df.plot[is.infinite(min.potency.dev), min.potency.dev := 4] 
+df.plot[is.infinite(min.potency.cyto.acute), min.potency.cyto.acute := NA]
+df.plot[is.infinite(min.potency.cyto.dev), min.potency.cyto.dev := NA]
+
+# calc hit rates and assays screened
+hit.rates <-  df.plot[ , list(
+  total.assay.screened  = .N, #total number of aeids tested in mc
+  active.assay.count  = as.double(lw(hitc.sel == 1)), 
+  inactive.assay.count  = as.double(lw(hitc.sel==0)),  #inactive count
+  active.percent = round((lw(hitc.sel==1)/.N)*100,2), #active percent
+  inactive.percent = round((lw(hitc.sel==0)/.N)*100,2) #inactive percent
+), by = list(chnm_assay)]
+
+
+df.plot$hitrate <- hit.rates$active.percent[match( df.plot$chnm_assay, hit.rates$chnm_assay )]
+df.plot$active.assay.count <- hit.rates$active.assay.count[match(df.plot$chnm_assay,hit.rates$chnm_assay)]
+df.plot$total.assay.screened <- hit.rates$total.assay.screened[match( df.plot$chnm_assay,hit.rates$chnm_assay)]
+
+df.plot.long <- melt.data.table(df.plot, id.vars = c('chnm', 
+                                                     'dsstox_substance_id',
+                                                     'assay_type',
+                                                     'chnm_assay',
+                                                     'hitrate',
+                                                     'active.assay.count',
+                                                     'total.assay.screened'), 
+                                measure.vars = c(#'min.potency.acute',
+                                                 #'min.potency.dev',
+                                                 'min.potency.cyto.acute',
+                                                 'min.potency.cyto.dev'),
+                                variable.name = 'Comparator')
+df.plot.long <- unique(df.plot.long)
+
+# plot
+df.plot[, med.pot := median(sel.ac50, na.rm=T), by=c('chnm','assay_type')]
+df.plot <- df.plot[order(med.pot),]
+df.plot$chnm <- factor(df.plot$chnm, levels = unique(df.plot$chnm), ordered = T) 
+
+p <- ggplot(df.plot, aes(x=chnm, y=sel.ac50))+
+  geom_boxplot(aes(fill=factor(assay_type)), outlier.shape=NA, notch = FALSE, 
+               position = position_dodge(width=0.2), 
+               show.legend = TRUE, 
+               #varwidth = TRUE
+               width=0.7, alpha=0.5)+
+  xlab("Chemical")+
+  ylab(expression(paste("Potency (log10-",mu,"M)")))+
+  theme_bw() +
+  geom_text(data=df.plot.long[assay_type %in% "acute",], 
+            aes(x=chnm, 
+                y= 4, 
+                label=paste(active.assay.count, "/", total.assay.screened),
+                group='chnm'),  
+            size=3)+
+    geom_point(data = df.plot.long, 
+             aes(x = factor(chnm), 
+                 y = value, color = factor(Comparator)), size = 2) +
+  scale_color_manual(values= c( "grey", "#e282d5"),
+                     breaks=c("min.potency.cyto.acute","min.potency.cyto.dev"),
+                     labels=c("AcN min cytotox", "NFA min cytotx"))+
+  # scale_shape_manual(values=c(15,15,17,17),
+  #                    breaks=c("min.potency.acute", "min.potency.dev", "min.potency.cyto.acute","min.potency.cyto.dev"),
+  #                    labels=c("AcN min potency", "NFA min potency", "AcN cytotox min potency", "NFA cytotox min potency"))+
+  geom_text(data=df.plot.long[assay_type %in% "dev",], 
+            aes(x=chnm, 
+                y= 6, 
+                label=paste(active.assay.count, "/", total.assay.screened),
+                group='chnm'),  
+            size=3,
+            #position = position_jitterdodge(jitter.height = 0.2, jitter.width = 0.1, dodge.width = 0.1) #getting error: Error in `f()`: ! `position_jitterdodge()` requires at least one aesthetic to dodge by
+            #position = position_dodge(5), 
+            #stringWidth(df.plot.long, 100)
+  )+
+    theme(legend.position="right",
+        legend.direction = "vertical",
+        # axis.title.y =  element_text(size = 14, margin = margin(r=-0.5, unit = "cm"), face = "bold"),
+        # axis.title.x = element_text(margin = margin(t=0.5, unit = "cm"), hjust = 0.22 ),
+        legend.title = element_blank()
+        # legend.text = element_text(size = 7), 
+        #legend.text.align = 
+        #axis.text.y.left = element_text(margin = margin(2, unit = "cm")), 
+        #axis.text.x = element_text(margin = margin(2, unit = "cm"))
+        #plot.margin = margin(2,2,2,2, "cm"),
+  )+
+  #annotate("text", x = 0.5, y = 5, label = "Acute", size=3)+
+  #labs(tag = "Acute") +
+  #theme(plot.tag.position = c(0.785, 0.04), plot.margin=unit(c(0,0,2,0), "cm"))+
+  theme(text = element_text(size = 16)) +
+  annotation_custom(grob = grid::textGrob(label = "Acute:", hjust=0, gp=gpar(col="black", cex=1)),
+                    xmin = 1, xmax = 1, ymin = 2.7, ymax = 3) +
+  annotation_custom(grob = grid::textGrob(label = "Dev:", hjust=0, gp=gpar(col="black", cex=1)),
+                    xmin = 1, xmax = 1, ymin = 5, ymax = 5.2) +
+  ggtitle("Chemicals more potent in acute")+
+  coord_flip(ylim=c(-4,6))
+p
+
+
+ggsave(p, file='figures/Supp_Fig4B_potency_plot_more_pot_acute.png', width=11, height=6)
+
+```
+
+### More potent NFA
+```{r warning=FALSE, message=FALSE}
+
+#plot
+df.plot <- df.mc[chnm %in% chem.nfa.pot,]
+df.plot[, chnm_assay := paste0(chnm,"_",assay_type)]
+
+# add metrics
+df.plot[, min.potency.acute := min(sel.ac50[assay_type=="acute"], na.rm=TRUE), by= list(chnm_assay)]
+df.plot[, min.potency.dev := min(sel.ac50[assay_type=="dev"], na.rm=TRUE), by= list(chnm_assay)] 
+df.plot[, min.potency.cyto.acute := min(modl_ga[aeid %in% cyto.aeid & assay_type=="acute"], na.rm=TRUE), by= list(chnm_assay)] 
+df.plot[, min.potency.cyto.dev := min(modl_ga[aeid %in% cyto.aeid & assay_type=="dev"], na.rm=TRUE), by= list(chnm, assay_type)] 
+
+# df.plot[is.infinite(min.potency.acute), min.potency.acute := 4]
+# df.plot[is.infinite(min.potency.dev), min.potency.dev := 4] 
+df.plot[is.infinite(min.potency.cyto.acute), min.potency.cyto.acute := NA]
+df.plot[is.infinite(min.potency.cyto.dev), min.potency.cyto.dev := NA]
+
+# calc hit rates and assays screened
+hit.rates <-  df.plot[ , list(
+  total.assay.screened  = .N, #total number of aeids tested in mc
+  active.assay.count  = as.double(lw(hitc.sel == 1)), 
+  inactive.assay.count  = as.double(lw(hitc.sel==0)),  #inactive count
+  active.percent = round((lw(hitc.sel==1)/.N)*100,2), #active percent
+  inactive.percent = round((lw(hitc.sel==0)/.N)*100,2) #inactive percent
+), by = list(chnm_assay)]
+
+
+df.plot$hitrate <- hit.rates$active.percent[match( df.plot$chnm_assay, hit.rates$chnm_assay )]
+df.plot$active.assay.count <- hit.rates$active.assay.count[match(df.plot$chnm_assay,hit.rates$chnm_assay)]
+df.plot$total.assay.screened <- hit.rates$total.assay.screened[match( df.plot$chnm_assay,hit.rates$chnm_assay)]
+
+df.plot.long <- melt.data.table(df.plot, id.vars = c('chnm', 
+                                                     'dsstox_substance_id',
+                                                     'assay_type',
+                                                     'chnm_assay',
+                                                     'hitrate',
+                                                     'active.assay.count',
+                                                     'total.assay.screened'), 
+                                measure.vars = c(#'min.potency.acute',
+                                                 #'min.potency.dev',
+                                                 'min.potency.cyto.acute',
+                                                 'min.potency.cyto.dev'),
+                                variable.name = 'Comparator')
+df.plot.long <- unique(df.plot.long)
+
+# plot
+df.plot[, med.pot := median(sel.ac50, na.rm=T), by=c('chnm','assay_type')]
+df.plot <- df.plot[order(med.pot),]
+df.plot$chnm <- factor(df.plot$chnm, levels = unique(df.plot$chnm), ordered = T) 
+
+p <- ggplot(df.plot, aes(x=chnm, y=sel.ac50))+
+  geom_boxplot(aes(fill=factor(assay_type)), outlier.shape=NA, notch = FALSE, 
+               position = position_dodge(width=0.2), 
+               show.legend = TRUE, 
+               #varwidth = TRUE
+               width=0.7, alpha=0.5)+
+  xlab("Chemical")+
+  ylab(expression(paste("Potency (log10-",mu,"M)")))+
+  theme_bw() +
+  geom_text(data=df.plot.long[assay_type %in% "acute",], 
+            aes(x=chnm, 
+                y= 4, 
+                label=paste(active.assay.count, "/", total.assay.screened),
+                group='chnm'),  
+            size=3)+
+    geom_point(data = df.plot.long, 
+             aes(x = factor(chnm), 
+                 y = value, color = factor(Comparator)), size = 2) +
+  scale_color_manual(values= c( "grey", "#e282d5"),
+                     breaks=c("min.potency.cyto.acute","min.potency.cyto.dev"),
+                     labels=c("AcN min cytotox", "NFA min cytotx"))+
+  geom_text(data=df.plot.long[assay_type %in% "dev",], 
+            aes(x=chnm, 
+                y= 6, 
+                label=paste(active.assay.count, "/", total.assay.screened),
+                group='chnm'),  
+            size=3,
+  )+
+    theme(legend.position="right",
+        legend.direction = "vertical",
+        legend.title = element_blank()
+  )+
+  theme(text = element_text(size = 16)) +
+  annotation_custom(grob = grid::textGrob(label = "Acute:", hjust=0, gp=gpar(col="black", cex=1)),
+                    xmin = 1, xmax = 1, ymin = 2.7, ymax = 3) +
+  annotation_custom(grob = grid::textGrob(label = "Dev:", hjust=0, gp=gpar(col="black", cex=1)),
+                    xmin = 1, xmax = 1, ymin = 5, ymax = 5.2) +
+  ggtitle("Chemicals more potent in NFA")+
+  coord_flip(ylim=c(-4,6))
+p
+
+ggsave(p, file='figures/Supp_Fig4A_Potency_plot_more_pot_NFA.png', width=12, height=6)
+
+
+colch <- df.plot[chnm %in% "Colchicine", c('chnm','aenm','hitc','modl_ga')]
+
+```
+
+
+# 7. Patters of bioactivity
+
+## Heatmap
+```{r warning=FALSE, message=FALSE}
+
+# Heatmap (using selective AC50s) --------------------------------------------
+
+#exclude cyto endpoints
+df.stats <- df.mc[!aeid %in% cyto.aeid,]
+df.stats[, sel.ac50 := modl_ga]
+df.stats[hitc.sel==0, sel.ac50 := NA]
+
+mat.all <- dcast.data.table(df.stats, chnm + casn + dsstox_substance_id ~ aenm,
+                            value.var = c('sel.ac50'))
+
+mat.all[chnm %in% "4-(4-Chlorophenyl)-4-hydroxy-N,N-dimethyl-alpha,alpha-diphenylpiperidine-1-butyramide monohydrochloride", chnm := "Loperamide"]
+
+#replace NA's with 4
+names(mat.all)
+mat.all2 <- mat.all[,lapply(.SD, function(x){ifelse(is.na(x),3,x)}), .SDcol=c(4:47)]
+matrix <- as.matrix(mat.all2)
+rownames(matrix) <- mat.all[,chnm] #adds names to the row name column
+
+#legends for heatmap
+#create column legend
+col_legend <- unique(df.stats[,c('aenm','assay_type', 'dir','category')])
+col_legend[assay_type %in% "dev", assay_type := "NFA"]
+setnames(col_legend, "dir","direction")
+rownames(col_legend) <- col_legend$aenm
+col_legend$aenm <- NULL
+
+#assign colors to the legends
+unique(df.stats$category)
+unique(df.stats$dir)
+ann_colors = list(
+  category = c(General = "#E69F00", 
+               #`General activity (network)` = "#b8b0b0", 
+               `Network Synchrony` = "#CC79A7", 
+               Oscillatory = "#18bec9", 
+               `Burst Structure` = "#F0E442"),
+  direction = c(Increase = "tan", Decrease = "brown"),
+  assay_type = c(acute = "#117733", NFA = "dodgerblue")
+)
+
+pheatmap(matrix, scale='none', 
+         filename = "./figures/Fig4_heatmap_sel_activity_acute_dev_Jan2024.png",
+         width = 20,
+         height = 17,
+         color= hcl.colors(50, "YlGnBu", rev=F),
+         breaks = NA, 
+         colsep = c(1:28), rowsep = c(1:154), sepcolor='white', sepwidth=c(0.05,0.05), 
+         clustering_method = "ward.D2", #hclustfun = function(x) hclust(x, method="ward.D2"),
+         cluster_cols = TRUE,
+         cluster_rows = TRUE,
+         treeheight_row = 60,
+         treeheight_col = 60,
+         cutree_rows = 4,
+         #cutree_cols = 4,
+         border_color = "gray95",
+         labels_col = substr(colnames(matrix),17,100),
+         margins = c(100,100),
+         fontsize_row =9, #cexRow =0.6,  #Font size row labels/chemicals
+         fontsize_col = 14, #cexCol=0.5,   #font size column labels/aenms
+         angle_col = 45, #srtCol=35,  #angle of row/column labels
+         legend = TRUE,
+         annotation_col = col_legend,
+         annotation_colors = ann_colors,
+         annotation_legend = TRUE
+)
+dev.off()
+
+# export dendrogram clusters
+# res <- pheatmap(matrix)
+# res.clusts <- cutree(res$tree_row, h=15)
+# clust1 <- data.frame(unlist(res.clusts))
+# clust1 <- as.data.table(clust1, keep.rownames=T)
+# write.csv(clust.jac,"output/Clust_heatmap.csv")
+
+acute.up <- c("Endrin", "Endosulfan", "Lindane", "Heptachlor", "Chlordane", "Anthracene", "Heptachlor epoxide B", "Dieldrin", "Fipronil", "Enadoline", "Reserpine", "Chlorpyrifos oxon")
+
+unique(df.mc[chnm %in% acute.up, chnm])
+
+cyto.acute.up <- df.mc[aeid %in% cyto.aeid & chnm %in% acute.up, c('chnm','aenm','hitc','modl_ga')]
+unique(cyto.acute.up[hitc==1,chnm])
+mean(cyto.acute.up$modl_ga, na.rm=T)
+sd(cyto.acute.up$modl_ga, na.rm=T)
+
+# potency in just the acute up endpoints
+cyto.acute.up <- df.mc[!aeid %in% cyto.aeid & assay_type %in% "acute" & dir %in% "Increase" & chnm %in% acute.up, c('chnm','aenm','hitc','modl_ga')]
+unique(cyto.acute.up[hitc==1,chnm])
+mean(cyto.acute.up$modl_ga, na.rm=T)
+sd(cyto.acute.up$modl_ga, na.rm=T)
+
+```
+
+
+## DIV12 endpoints for acute up chemicals
+```{r warning=FALSE, message=FALSE}
+
+load("source/MEA_DIV12_tcplsubsetchid_2022-02-10.Rdata")
+setnames(mc5.div12,"flag_length","flag.length")
+mc5.div12 <- mc5_filter(mc5.div12)
+up.div12 <- mc5.div12[chnm %in% acute.up,]
+unique(up.div12$chnm)
+up.div12[, hitsum := sum(hitc), by='chnm']
+unique(up.div12[, c('chnm','hitsum')])
+up.div12$assay_type <- "dev"
+
+# merge activity categories
+div12.act <- read.xlsx("input/DIV12_endpoints_map_category_6July2023.xlsx")
+up.div12 <- merge(up.div12, div12.act, by=c('aenm','aeid'))
+
+# need to add selectivity column
+cyto.bind <- df[assay_type %in% "dev" & is.cyto==1 & chnm %in% acute.up,]
+up.div12 <- rbind(up.div12, cyto.bind, fill=T)
+
+# identify cyto coff by min cyto between LDH and AB for each assay type
+cyto.hits <- up.div12[is.cyto==1 & hitc==1,]
+cyto.hits[, cyto.coff := min(modl_ga, na.rm=T), by=c('chnm','assay_type')]
+cyto.hits.sum <- unique(cyto.hits[, c('chnm','assay_type','cyto.coff')])
+up.div12$cyto.coff <- NULL
+up.div12 <- merge(up.div12, cyto.hits.sum, by=c('chnm','assay_type'), all.x=T)
+
+# add classification
+up.div12[, sel.score := cyto.coff-modl_ga]
+up.div12[, hitc.sel := ifelse(sel.score>0.3,1,0)]
+up.div12[hitc==1 & is.na(cyto.coff), hitc.sel := 1]
+up.div12[is.na(hitc.sel), hitc.sel := 0]
+
+# selective hitsum
+up.div12[, hitsum.sel := sum(hitc.sel), by='chnm']
+unique(up.div12[, c('chnm','hitsum.sel')])
+```
+
+### Heatmap acute up chems in NFA
+```{r warning=FALSE, message=FALSE}
+
+df.stats <- df.mc[chnm %in% acute.up & assay_type %in% "dev" & !is.cyto==1,]
+df.stats[, hitsum.up := sum(hitc.sel), by=chnm]
+df.stats$hitsum.up
+df.stats <- df.stats[order(hitsum.up,chnm, decreasing=T),]
+
+df.stats$hitsum.up
+order.chem <- unique(df.stats[, c('chnm','hitsum.up')])
+
+# make heatmap of NFA (AUC) data for these 12 chemicals
+mat.all <- dcast.data.table(df.stats, chnm + casn + dsstox_substance_id ~ aenm,
+                            value.var = c('sel.ac50'))
+
+#replace NA's with 4
+names(mat.all)
+mat.all2 <- mat.all[,lapply(.SD, function(x){ifelse(is.na(x),3,x)}), .SDcol=c(4:17)]
+matrix <- as.matrix(mat.all2)
+rownames(matrix) <- mat.all[,chnm] #adds names to the row name column
+
+# set col order by category
+col.order.set <- as.data.table(colnames(matrix))
+setnames(col.order.set, 1,'aenm')
+col.order.set$category <- df.stats$category[match(col.order.set$aenm, df.stats$aenm)]
+col.order.set <- col.order.set[order(category)]
+col.order.set <- col.order.set$aenm
+matrix <- matrix[order.chem$chnm,col.order.set]
+rownames(matrix)
+
+#legends for heatmap
+#create column legend
+col_legend <- unique(df.stats[,c('aenm','assay_type', 'dir','category')])
+setnames(col_legend,'dir','direction')
+rownames(col_legend) <- col_legend$aenm
+col_legend$aenm <- NULL
+
+#assign colors to the legends
+unique(df.stats$category)
+unique(df.stats$dir)
+ann_colors = list(
+  category = c(General = "#E69F00", 
+               #`General activity (network)` = "#b8b0b0", 
+               `Network Synchrony` = "#CC79A7", 
+               Oscillatory = "#18bec9", 
+               `Burst Structure` = "#F0E442"),
+  direction = c(Increase = "tan", Decrease = "brown"),
+  assay_type = c(acute = "#117733", dev = "dodgerblue")
+)
+
+pheatmap(matrix, scale='none', 
+         filename = "./figures/Supp_Fig6A_heatmap_12acute_up_chems_NFA_sel_activity.png",
+         width = 10,
+         height = 7,
+         color = viridis(20,option='D'),
+         breaks = NA,
+         colsep = c(1:28), rowsep = c(1:154), sepcolor='white', sepwidth=c(0.05,0.05), 
+         clustering_method = "ward.D2", 
+         cluster_cols = F,
+         cluster_rows = F,
+         treeheight_row = 100,
+         treeheight_col = 100,
+         border_color = "white",
+         labels_col = substr(colnames(matrix),21,100),
+         margins = c(100,100), 
+         cellwidth = 14,
+         cellheight = 14,
+         fontsize_row =10, #cexRow =0.6,  #Font size row labels/chemicals
+         fontsize_col = 10, #cexCol=0.5,   #font size column labels/aenms
+         angle_col = 45, #srtCol=35,  #angle of row/column labels
+         legend = TRUE,
+         annotation_col = col_legend,
+         annotation_colors = ann_colors,
+         annotation_legend = TRUE
+)
+
+```
+
+### Heatmap acute up chems in NFA DIV12
+```{r warning=FALSE, message=FALSE}
+up.div12[, sel.ac50 := modl_ga]
+up.div12[hitc.sel==0, sel.ac50 := NA]
+df.stats <- up.div12[!is.cyto %in% 1,]
+
+# make heatmap of NFA (AUC) data for these 12 chemicals
+mat.all <- dcast.data.table(df.stats, chnm + casn + dsstox_substance_id ~ aenm,
+                            value.var = c('sel.ac50'))
+
+mat.all[chnm %in% "4-(4-Chlorophenyl)-4-hydroxy-N,N-dimethyl-alpha,alpha-diphenylpiperidine-1-butyramide monohydrochloride", chnm := "Loperamide"]
+
+#replace NA's with 4
+names(mat.all)
+mat.all2 <- mat.all[,lapply(.SD, function(x){ifelse(is.na(x),3,x)}), .SDcol=c(4:37)]
+matrix <- as.matrix(mat.all2)
+rownames(matrix) <- mat.all[,chnm] #adds names to the row name column
+
+# set col order by category
+col.order.set <- as.data.table(colnames(matrix))
+setnames(col.order.set, 1,'aenm')
+col.order.set$category <- df.stats$category[match(col.order.set$aenm, df.stats$aenm)]
+col.order.set$dir <- df.stats$dir[match(col.order.set$aenm, df.stats$aenm)]
+
+col.order.set <- col.order.set[order(category,dir)]
+col.order.set <- col.order.set$aenm
+matrix <- matrix[order.chem$chnm,col.order.set]
+rownames(matrix)
+
+#legends for heatmap
+#create column legend
+col_legend <- unique(df.stats[,c('aenm','assay_type', 'dir','category')])
+setnames(col_legend,'dir','direction')
+rownames(col_legend) <- col_legend$aenm
+col_legend$aenm <- NULL
+
+#assign colors to the legends
+unique(df.stats$category)
+unique(df.stats$dir)
+ann_colors = list(
+  category = c(General = "#E69F00", 
+               #`General activity (network)` = "#b8b0b0", 
+               `Network Synchrony` = "#CC79A7", 
+               Oscillatory = "#18bec9", 
+               `Burst Structure` = "#F0E442"),
+  direction = c(Increase = "tan", Decrease = "brown"),
+  assay_type = c(acute = "#117733", dev = "dodgerblue")
+)
+
+pheatmap(matrix, scale='none', 
+         filename = "./figures/Supp_Fig6B_heatmap_12acute_up_chems_DIV12end.png",
+         width = 13,
+         height = 7,
+         color = viridis(20,option='D'),
+         #color = viridis(50, option='magma', direction=1), #col=viridis(20,option='D'), 
+         breaks = NA, #symbreaks=F,
+         #symm=F,
+         #symkey=F,
+         #trace='none', density.info = 'none',
+         colsep = c(1:28), rowsep = c(1:154), sepcolor='white', sepwidth=c(0.05,0.05), # which columns or rows should be separated from the preceding columns or rows by a narrow space of color
+         clustering_method = "ward.D2", #hclustfun = function(x) hclust(x, method="ward.D2"),
+         cluster_cols = F,
+         cluster_rows = F,
+         treeheight_row = 100,
+         treeheight_col = 100,
+         #cutree_rows = 4,
+         #cutree_cols = 4,
+         border_color = "white",
+         labels_col = substr(colnames(matrix),21,100),
+         #treeheight_row = ,
+         #treeheight_col = ,
+         #labRow = row.names(matrix),
+         #labRow = substr(rownames(matrix),0,100),
+         margins = c(100,100), #margins for column and row names; making these bigger provides more room for legend
+         cellwidth = 14,
+         cellheight = 14,
+         # labels_row=NULL,
+         # labels_col=NULL,
+         fontsize_row =10, #cexRow =0.6,  #Font size row labels/chemicals
+         fontsize_col = 9, #cexCol=0.5,   #font size column labels/aenms
+         angle_col = 45, #srtCol=35,  #angle of row/column labels
+         legend = TRUE,
+         #annotation_row = annotation_row_legend2,
+         annotation_col = col_legend,
+         annotation_colors = ann_colors,
+         annotation_legend = TRUE
+         #annotation_names_row = DNT.pos.tbl$reference,
+         #annotation_names_col = activity.legend$activity
+         #annotation_names_col = 
+         #keysize=0.5)
+)
+
+```
+
+### Heatmap acute up chems in acute
+```{r warning=FALSE, message=FALSE}
+
+df.stats <- df.mc[chnm %in% acute.up & assay_type %in% "acute" & !is.cyto==1,]
+
+# make heatmap of NFA (AUC) data for these 12 chemicals
+mat.all <- dcast.data.table(df.stats, chnm + casn + dsstox_substance_id ~ aenm,
+                            value.var = c('sel.ac50'))
+
+#replace NA's with 4
+names(mat.all)
+mat.all2 <- mat.all[,lapply(.SD, function(x){ifelse(is.na(x),3,x)}), .SDcol=c(4:33)]
+matrix <- as.matrix(mat.all2)
+rownames(matrix) <- mat.all[,chnm] #adds names to the row name column
+
+# set col order by category
+col.order.set <- as.data.table(colnames(matrix))
+setnames(col.order.set, 1,'aenm')
+col.order.set$category <- df.stats$category[match(col.order.set$aenm, df.stats$aenm)]
+col.order.set$dir <- df.stats$dir[match(col.order.set$aenm, df.stats$aenm)]
+
+col.order.set <- col.order.set[order(category,dir)]
+col.order.set <- col.order.set$aenm
+matrix <- matrix[order.chem$chnm,col.order.set]
+rownames(matrix)
+
+#legends for heatmap
+#create column legend
+col_legend <- unique(df.stats[,c('aenm','assay_type', 'dir','category')])
+setnames(col_legend,'dir','direction')
+rownames(col_legend) <- col_legend$aenm
+col_legend$aenm <- NULL
+
+#assign colors to the legends
+unique(df.stats$category)
+unique(df.stats$dir)
+ann_colors = list(
+  category = c(General = "#E69F00", 
+               #`General activity (network)` = "#b8b0b0", 
+               `Network Synchrony` = "#CC79A7", 
+               Oscillatory = "#18bec9", 
+               `Burst Structure` = "#F0E442"),
+  direction = c(Increase = "tan", Decrease = "brown"),
+  assay_type = c(acute = "#117733", dev = "dodgerblue")
+)
+
+library(pheatmap)
+pheatmap(matrix, scale='none', 
+         filename = "./figures/Supp_Fig6C_heatmap_12acute_up_chems_acute.png",
+         width = 13,
+         height = 7,
+         color = viridis(20,option='D'),
+         breaks = NA,
+         colsep = c(1:28), rowsep = c(1:154), sepcolor='white', sepwidth=c(0.05,0.05), 
+         clustering_method = "ward.D2", #hclustfun = function(x) hclust(x, method="ward.D2"),
+         cluster_cols = F,
+         cluster_rows = F,
+         treeheight_row = 100,
+         treeheight_col = 100,
+         border_color = "white",
+         labels_col = substr(colnames(matrix),23,100),
+         margins = c(100,100), 
+         cellwidth = 14,
+         cellheight = 14,
+         fontsize_row =10,
+         fontsize_col = 9, 
+         angle_col = 45, 
+         legend = TRUE,
+         annotation_col = col_legend,
+         annotation_colors = ann_colors,
+         annotation_legend = TRUE
+)
+
+```
+
+## Jaccard Distance
+```{r warning=FALSE, message=FALSE}
+
+# actives here are considered selectivity active OR cyto hit
+df.mc[chnm %in% "4-(4-Chlorophenyl)-4-hydroxy-N,N-dimethyl-alpha,alpha-diphenylpiperidine-1-butyramide monohydrochloride", chnm := "Loperamide"]
+
+df.mc2 <- df.mc[!aeid %in% cyto.aeid,]
+df.mc2[, hitc.sel.cyto := hitc.sel]
+df.mc2[, cat2 := paste0(category,"_",dir)]
+df.mc2[category %in% "Cytotoxicity", cat2 := "Cytotoxicity"]
+
+# compute binary activity by category
+df.mc2[ , jac.bin := ifelse(any(hitc.sel.cyto==1),1,0), by=c('chnm','assay_type','cat2')]
+test <- df.mc2[, c('chnm','aenm','hitc','hitc.sel','hitc.sel.cyto','jac.bin','category','dir')]
+df.mc2[, cat2 := paste0(category,"_",dir)]
+
+# make fingerprints for acute------------------------------------------
+jac.df <- unique(df.mc2[, c('chnm','assay_type','cat2','jac.bin')])
+jac.acute <- jac.df[assay_type %in% "acute",]
+jac.acute[, n.row := .N, by=chnm]
+
+jac.acute.wide <- as.data.table(dcast(jac.acute,
+                    chnm ~ cat2, value.var="jac.bin"))
+jac.acute.df <- as.data.frame(jac.acute.wide)
+rownames(jac.acute.df) <- jac.acute.df$chnm
+
+jac.acute.df$chnm <- NULL
+
+dist <- dist_make(jac.acute.df, jaccard::jaccard)
+x.acute <- as.matrix(dist)
+
+for (i in 1:nrow(x.acute)){
+  x.acute[i,i]=1
+}
+
+p <- pheatmap(x.acute,
+         color = hcl.colors(50, "YlGnBu", rev=T),
+         na_col="gray96")
+ggsave(p, file="figures/Fig5A_distance_jaccard_acute_fingerprint_selective_label.png", height=20, width=20)
+
+# export dendrogram clusters
+res <- pheatmap(x.acute)
+chems <- res$tree_row$labels
+order <- res$tree_row$order
+dendro <- data.frame(chems,order)
+
+res.clusts <- cutree(res$tree_row, k=12)
+clust.jac <- data.frame(unlist(res.clusts))
+clust.jac <- as.data.table(clust.jac, keep.rownames=T)
+setnames(clust.jac, c('rn','unlist.res.clusts.'), c('Chemical','Cluster_acute'))
+#dendro$cluster <- clust.jac$Cluster[match(dendro$chems, clust.jac$Chemical)]
+
+clust.jac <- clust.jac[order(Cluster_acute),]
+use.class <- as.data.table(read.xlsx('input/Chem_243_mfr_chem_class_Jul_21_TJS.xlsx'))
+clust.jac$chem_cat <- use.class$Organo_cats[match(clust.jac$Chemical, use.class$chnm)]
+clust.jac.all <- clust.jac
+#write.csv(clust.jac,"output/Jacc_clust_use_cat_acute.csv")
+
+x.acute.null <- x.acute
+rownames(x.acute.null) <- NULL
+colnames(x.acute.null) <- NULL
+p <- pheatmap(x.acute.null,
+         color = hcl.colors(50, "YlGnBu", rev=T),
+         na_col="gray96")
+ggsave(p, file="figures/Fig5A_distance_jaccard_acute_fingerprint_selective_label_nolabel.png", height=20, width=20)
+
+# make fingerprints for dev----------------------------------------
+jac.df <- unique(df.mc2[, c('chnm','assay_type','cat2','jac.bin')])
+jac.dev <- jac.df[assay_type %in% "dev",]
+jac.dev[, n.row := .N, by=chnm]
+
+jac.dev.wide <- as.data.table(dcast(jac.dev,
+                    chnm ~ cat2, value.var="jac.bin"))
+jac.dev.df <- as.data.frame(jac.dev.wide)
+rownames(jac.dev.df) <- jac.dev.df$chnm
+jac.dev.df$chnm <- NULL
+
+dist <- dist_make(jac.dev.df, jaccard::jaccard)
+x.dev <- as.matrix(dist)
+for (i in 1:nrow(x.dev)){
+  x.dev[i,i]=1
+}
+
+p <- pheatmap(x.dev,
+         color = hcl.colors(50, "YlGnBu", rev=T),
+         na_col="gray96")
+p
+ggsave(p, file="figures/Fig5A_distance_jaccard_NFA_fingerprint_selective_label.png", height=20, width=20)
+
+# export dendrogram clusters
+res <- pheatmap(x.dev)
+res.clusts <- cutree(res$tree_row, k=12)
+clust.jac <- data.frame(unlist(res.clusts))
+clust.jac <- as.data.table(clust.jac, keep.rownames=T)
+setnames(clust.jac, c('rn','unlist.res.clusts.'), c('Chemical','Cluster'))
+clust.jac <- clust.jac[order(Cluster),]
+
+clust.jac.all$Cluster_dev <- clust.jac$Cluster[match(clust.jac.all$Chemical, clust.jac$Chemical)]
+#write.csv(clust.jac,"output/Jacc_clust_use_cat_dev.csv")
+clust.jac.all <- clust.jac.all[, c('Chemical','chem_cat','Cluster_acute','Cluster_dev')][order(Cluster_acute,chem_cat)]
+#write.csv(clust.jac.all,"output/Jacc_clust_use_cat_acute_dev.csv")
+
+x.dev.null <- x.dev
+rownames(x.dev.null) <- NULL
+colnames(x.dev.null) <- NULL
+p <- pheatmap(x.dev.null,
+         color = hcl.colors(50, "YlGnBu", rev=T),
+         na_col="gray96")
+ggsave(p, file="figures/Fig5A_distance_jaccard_NFA_fingerprint_selective_nolabel.png", height=20, width=20)
+```
+
+### Organochlorine Jaccard
+```{r warning=FALSE, message=FALSE}
+
+use.class <- as.data.table(read.xlsx('input/Chem_243_mfr_chem_class_Jul_21_TJS.xlsx'))
+check <- use.class[chnm %in% rownames(x.acute),]
+unique(use.class[order(chem_cat),chem_cat])
+
+organo.chems.order <- c('Lindane','Endrin','Heptachlor','Heptachlor epoxide B','Dieldrin','Endosulfan','Chlordane','Aldrin','Kepone','Mirex',"DDT","p,p'-DDD","p,p'-DDE", "Methoxychlor", "Hexachlorophene")
+
+organo.tbl <- use.class[chem_cat %in% "organochlorine" & chnm %in% rownames(x.acute),][order(match(chnm, organo.chems.order))]
+organo.tbl[, c('chnm','Organo_cats')]
+unique(organo.tbl$Organo_cats)
+
+organo <- organo.tbl$chnm
+organo
+
+x2.acute <- x.acute[organo,organo]
+mean(x2.acute)
+sd(x2.acute)
+
+#create column legend
+col_legend <- use.class[!is.na(Organo_cats) & chnm %in% rownames(x2.acute),c('chnm','Organo_cats')]
+setnames(col_legend,"Organo_cats","Organochlorine Class")
+rownames(col_legend) <- col_legend$chnm
+col_legend$chnm <- NULL
+
+#assign colors to the legends
+unique(col_legend$Organo_cats)
+ann_colors = list(
+  `Organochlorine Class` = c(`chlorinated cyclodienes` = "grey25", 
+               dichlorodiphenylethanes = "grey48", 
+               diphenylmethanes = "grey68", 
+               hexchlorocyclohexanes = "grey86")
+  )
+
+p <- pheatmap(x2.acute,
+         color = hcl.colors(50, "YlGnBu", rev=T),
+         cluster_cols = F,
+         cluster_rows = F,
+         na_col="gray96",
+                 legend=T,
+        annotation_col=col_legend,
+        annotation_row=col_legend,
+        annotation_colors=ann_colors,
+        annotation_legend=T,
+        annotation_names_row=F,
+        annotation_names_col=F)
+p
+ggsave(p, file="figures/Fig5B_Distance_jaccard_organo_all_acute.png", height=5, width=7.5)
+
+# dev
+x2.dev <- x.dev[organo,organo]
+mean(x2.dev, na.rm=T)
+sd(x2.dev, na.rm=T)
+
+p <- pheatmap(x2.dev,
+         color = hcl.colors(50, "YlGnBu", rev=T),
+        cluster_cols = F,
+         cluster_rows = F,
+         na_col="gray96",
+        legend=T,
+        annotation_col=col_legend,
+        annotation_row=col_legend,
+        annotation_colors=ann_colors,
+        annotation_legend=T,
+        annotation_names_row=F,
+        annotation_names_col=F)
+p
+ggsave(p, file="figures/Fig5B_Distance_jaccard_organo_all_dev.png", height=5, width=7.5)
+
+# export stats
+organo.tbl[, chemicals := paste(chnm, collapse=","), by=Organo_cats]
+organo.tbl.stats <- unique(organo.tbl[, c('Organo_cats','chemicals')])
+
+for (i in unique(organo.tbl$Organo_cats)){
+  chems.int <- organo.tbl[Organo_cats %in% i, chnm]
+  x <- x2.acute[chems.int, chems.int]
+  mean.out <- mean(x, na.rm=T)
+  sd.out <- sd(x, na.rm=T)
+  organo.tbl.stats[Organo_cats %in% i, acute.mean.jac := mean.out]
+  organo.tbl.stats[Organo_cats %in% i, acute.sd.jac := sd.out]
+}
+
+for (i in unique(organo.tbl$Organo_cats)){
+  chems.int <- organo.tbl[Organo_cats %in% i, chnm]
+  x <- x2.dev[chems.int, chems.int]
+  mean.out <- mean(x, na.rm=T)
+  sd.out <- sd(x, na.rm=T)
+  organo.tbl.stats[Organo_cats %in% i, dev.mean.jac := mean.out]
+  organo.tbl.stats[Organo_cats %in% i, dev.sd.jac := sd.out]
+}
+#write.csv(organo.tbl.stats, 'output/Organochlorines_Jaccard_sum_stats.csv')
+
+```
+
+### Pyrethroid Jaccard
+```{r warning=FALSE, message=FALSE}
+
+# Plot for pyrethroid----------------------------------------------------------------------------
+use.class <- as.data.table(read.xlsx('input/Chem_243_mfr_chem_class_Jul_21_TJS.xlsx'))
+unique(use.class[order(chem_cat),chem_cat])
+
+pyreth.tbl <- use.class[chem_cat %in% "pyrethroid" & chnm %in% rownames(x.acute),][order(Organo_cats)]
+unique(pyreth.tbl$Organo_cats)
+
+pyreth.tbl$Organo_cats
+pyreth <- pyreth.tbl$chnm
+
+x2.acute <- x.acute[pyreth,pyreth]
+mean(x2.acute)
+sd(x2.acute)
+
+#create column legend
+col_legend <- pyreth.tbl[!is.na(Organo_cats), c('chnm','Organo_cats')]
+setnames(col_legend,"Organo_cats","Pyrethroid Class")
+rownames(col_legend) <- col_legend$chnm
+col_legend$chnm <- NULL
+
+#assign colors to the legends
+unique(col_legend$`Pyrethroid Class`)
+ann_colors = list(
+  `Pyrethroid Class` = c(Type_I= "grey25", 
+               Type_II = "grey48", 
+               mixed_TypeI_TypeII = "grey75")
+  )
+
+
+pyreth <- c('Permethrin','Prallethrin','S-Bioallethrin','Resmethrin','Tefluthrin', 'Tetramethrin','Bifenthrin','Cyfluthrin','Deltamethrin', 'alpha-Cypermethrin', 'beta-Cyfluthrin','tau-Fluvalinate','lambda-Cyhalothrin','Cypermethrin','Esfenvalerate','Fenpropathrin')
+
+x2.acute <- x.acute[pyreth,pyreth]
+
+p <- pheatmap(x2.acute,
+         color = hcl.colors(50, "YlGnBu", rev=T),
+         cluster_rows = F,
+         cluster_cols = F,
+         na_col="gray96", 
+        legend=T,
+        annotation_col=col_legend,
+        annotation_row=col_legend,
+        annotation_colors=ann_colors,
+        annotation_legend=T,
+        annotation_names_row=F,
+        annotation_names_col=F)
+p
+ggsave(p, file="figures/Fig5C_Distance_jaccard_pyreth_all_acute.png", height=6, width=8.5)
+
+# dev
+x2.dev <- x.dev[pyreth,pyreth]
+mean(x2.dev, na.rm=T)
+sd(x2.dev, na.rm=T)
+
+p <- pheatmap(x2.dev,
+         color = hcl.colors(50, "YlGnBu", rev=T),
+         cluster_rows = F,
+         cluster_cols = F,
+         na_col="gray96",
+        annotation_col=col_legend,
+        annotation_row=col_legend,
+        annotation_colors=ann_colors,
+        annotation_legend=T,
+        annotation_names_row=F,
+        annotation_names_col=F)
+p
+ggsave(p, file="figures/Fig5C_Distance_jaccard_pyreth_all_dev.png", height=6, width=8.5)
+
+
+# export stats
+pyreth.tbl[, chemicals := paste(chnm, collapse=","), by=Organo_cats]
+pyreth.tbl.stats <- unique(pyreth.tbl[, c('Organo_cats','chemicals')])
+
+#acute
+for (i in unique(pyreth.tbl$Organo_cats)){
+  chems.int <- pyreth.tbl[Organo_cats %in% i, chnm]
+  x <- x2.acute[chems.int, chems.int]
+  mean.out <- mean(x, na.rm=T)
+  sd.out <- sd(x, na.rm=T)
+  pyreth.tbl.stats[Organo_cats %in% i, acute.mean.jac := mean.out]
+  pyreth.tbl.stats[Organo_cats %in% i, acute.sd.jac := sd.out]
+}
+
+#dev
+for (i in unique(pyreth.tbl$Organo_cats)){
+  chems.int <- pyreth.tbl[Organo_cats %in% i, chnm]
+  x <- x2.dev[chems.int, chems.int]
+  mean.out <- mean(x, na.rm=T)
+  sd.out <- sd(x, na.rm=T)
+  pyreth.tbl.stats[Organo_cats %in% i, dev.mean.jac := mean.out]
+  pyreth.tbl.stats[Organo_cats %in% i, dev.sd.jac := sd.out]
+}
+#write.csv(pyreth.tbl.stats, 'output/Pyrethroids_Jaccard_sum_stats.csv')
+
+```
+
+# 8. Supplemental Tables
+
+## Chemical Summary table
+```{r  results= "hide", warning=FALSE, message=FALSE}
+chem.tbl <- unique(df[, c('chnm','dsstox_substance_id', 'casn')])
+chem.tbl[, Screen_AcN_MC := ifelse(dsstox_substance_id %in% mc.acute, 1,0)]
+chem.tbl[, Screen_NFA_MC := ifelse(dsstox_substance_id %in% mc.dev, 1,0)]
+sc.acute <- unique(sc2.neuro[screen %in% "sc" & assay_type %in% "acute",dsstox_substance_id])
+sc.dev <- unique(sc2.neuro[screen %in% "sc" & assay_type %in% "dev",dsstox_substance_id])
+chem.tbl[, Screen_AcN_SC := ifelse(dsstox_substance_id %in% sc.acute, 1,0)]
+chem.tbl[, Screen_NFA_SC := ifelse(dsstox_substance_id %in% sc.dev, 1,0)]
+
+# add min and max potency tested
+mc.acute.chem.tbl <- df[assay_type %in% "acute" & screen %in% "mc",]
+chem.tbl$Min_pot_MC_AcN_logc <- mc.acute.chem.tbl$logc_min[match(chem.tbl$chnm, mc.acute.chem.tbl$chnm)]
+chem.tbl$Max_pot_MC_AcN_logc <- mc.acute.chem.tbl$logc_max[match(chem.tbl$chnm, mc.acute.chem.tbl$chnm)]
+mc.dev.chem.tbl <- df[assay_type %in% "dev" & screen %in% "mc",]
+chem.tbl$Min_pot_MC_NFA_logc <- mc.dev.chem.tbl$logc_min[match(chem.tbl$chnm, mc.dev.chem.tbl$chnm)]
+chem.tbl$Max_pot_MC_NFA_logc <- mc.dev.chem.tbl$logc_max[match(chem.tbl$chnm, mc.dev.chem.tbl$chnm)]
+
+chem.tbl$Pot_SC_AcN_logc <- sc2.neuro[assay_type %in% "acute",logc][match(chem.tbl$chnm, sc2.neuro$chnm)]
+chem.tbl$Pot_SC_NFA_logc <- sc2.neuro[assay_type %in% "dev",logc][match(chem.tbl$chnm, sc2.neuro$chnm)]
+
+```
+
+## Chemical-endpoint table
+```{r  results= "hide", warning=FALSE, message=FALSE}
+df.sum <- df[order(chnm), c('chnm','dsstox_substance_id','casn','aenm','assay_type','screen','hitc','modl_ga','hitc.sel','logc','flag.length')]
+
+```
+
+## NFA 'up' endpoints
+```{r  results= "hide", warning=FALSE, message=FALSE}
+nfa.up.tbl <- mc5.neuro[assay_type %in% "dev" & chnm %in% df.mc$chnm,]
+nfa.up.tbl <- nfa.up.tbl[grep("up",aenm),]
+nfa.up.sum <- nfa.up.tbl[order(chnm), c('chnm','dsstox_substance_id','casn','aenm','assay_type','screen','hitc','modl_ga','hitc.sel','flag.length')]
+
+nrow(df.mc[assay_type %in% "dev",])
+sum(df.mc[assay_type %in% "dev", hitc])
+
+```
+
+## Supp File
+```{r  results= "hide", warning=FALSE, message=FALSE}
+
+#read.me <- read.xlsx('input/README_supplementals.xlsx')
+
+list.supp <- list(#'README'= read.me,
+                  'SuppTb1'=chem.tbl,
+                  'SuppTb2'=end.cat.tbl,
+                  'SuppTb3'=methods.tbl.mc.sc,
+                  'SuppTb4'=df.sum,
+                  'SuppTb5'=clust.jac.all)
+
+write.xlsx(list.supp, file='./output/Supp_tbls_manuscript_Dec2023.xlsx', overwrite=TRUE)
+
+```
